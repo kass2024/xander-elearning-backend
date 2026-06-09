@@ -8,13 +8,19 @@ return new class extends Migration
 {
     public function up(): void
     {
+        if (!Schema::hasTable('users')) {
+            return;
+        }
+
         Schema::table('users', function (Blueprint $table) {
             if (!Schema::hasColumn('users', 'phone')) {
-                $table->string('phone')->nullable()->after('role');
+                $after = Schema::hasColumn('users', 'role') ? 'role' : 'password';
+                $table->string('phone')->nullable()->after($after);
             }
 
             if (!Schema::hasColumn('users', 'status')) {
-                $table->string('status')->nullable()->after('phone');
+                $after = Schema::hasColumn('users', 'phone') ? 'phone' : 'password';
+                $table->string('status')->default('Active')->after($after);
             }
         });
     }

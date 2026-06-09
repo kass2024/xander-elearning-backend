@@ -8,13 +8,13 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (Schema::hasTable('available_schedules')) {
+        if (Schema::hasTable('livezoom_cohort')) {
             return;
         }
 
-        Schema::create('available_schedules', function (Blueprint $table) {
+        Schema::create('livezoom_cohort', function (Blueprint $table) {
             $table->id();
-            $table->unsignedTinyInteger('day_of_week'); // 0=Sunday ... 6=Saturday
+            $table->unsignedTinyInteger('day_of_week');
             $table->time('start_time');
             $table->time('end_time');
             $table->string('timezone')->default('Africa/Kigali');
@@ -27,6 +27,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        Schema::dropIfExists('available_schedules');
+        Schema::dropIfExists('livezoom_cohort');
     }
 };

@@ -1,3 +1,38 @@
+# Xander Learning Hub — Backend API
+
+Laravel API for **Xander Learning Hub** (courses, students, Zoom, Stripe).
+
+## Database migrations (automated schema)
+
+All table changes live in `database/migrations/`. On any server:
+
+```bash
+php artisan migrate --force
+```
+
+Migrations use `Schema::hasTable()` / `Schema::hasColumn()` guards so they are safe on fresh installs and existing production databases.
+
+| Area | Migration files |
+|------|-----------------|
+| Users (role, phone, status, avatar) | `0001_*`, `2025_11_17_*`, `2025_11_11_*`, `2026_01_23_180000_*` |
+| Students | `2025_11_05_*`, `2025_11_23_*` |
+| Courses & enrollments | `2025_11_17_*`, `2025_11_18_*`, `2025_11_28_*` |
+| Meeting registrations | `2026_01_23_*`, `2026_06_09_120200_*` (sync) |
+| Live Zoom cohort | `2026_06_09_120000_*` |
+| Stripe payments log | `2026_06_09_120100_*` |
+| Zoom / Stripe env | `.env` — `ZOOM_*`, `STRIPE_*` |
+
+## Deploy checklist
+
+1. Copy `.env.example` → `.env` and set DB, Zoom, Stripe, mail keys  
+2. `composer install --no-dev --optimize-autoloader`  
+3. `php artisan migrate --force`  
+4. `php artisan config:cache`  
+
+Do **not** commit `.env`, `vendor/`, or `storage/` (see `.gitignore`).
+
+---
+
 <p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
 
 <p align="center">

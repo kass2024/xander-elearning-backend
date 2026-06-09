@@ -9,6 +9,7 @@ use Stripe\Checkout\Session as StripeCheckoutSession;
 use Stripe\PaymentIntent;
 use Stripe\Stripe;
 use App\Models\Course;
+use App\Models\CoursePayment;
 
 class PaymentController extends Controller
 {
@@ -52,6 +53,23 @@ class PaymentController extends Controller
                 'cancel_url' => config('app.url') . '/payment/cancel',
             ]);
 
+            CoursePayment::updateOrCreate(
+                [
+                    'course_id' => $course->id,
+                    'student_id' => $validated['student_id'],
+                    'stripe_session_id' => $session->id,
+                ],
+                [
+                    'amount_cents' => $amount,
+                    'currency' => 'usd',
+                    'provider' => 'stripe',
+                    'status' => 'pending',
+                    'metadata' => [
+                        'checkout_url' => $session->url,
+                    ],
+                ]
+            );
+
             return response()->json([
                 'url' => $session->url,
             ]);
@@ -93,6 +111,20 @@ class PaymentController extends Controller
                     'student_id' => (string) $validated['student_id'],
                 ],
             ]);
+
+            CoursePayment::updateOrCreate(
+                [
+                    'course_id' => $course->id,
+                    'student_id' => $validated['student_id'],
+                    'stripe_payment_intent_id' => $intent->id,
+                ],
+                [
+                    'amount_cents' => $amount,
+                    'currency' => 'usd',
+                    'provider' => 'stripe',
+                    'status' => 'pending',
+                ]
+            );
 
             return response()->json([
                 'client_secret' => $intent->client_secret,

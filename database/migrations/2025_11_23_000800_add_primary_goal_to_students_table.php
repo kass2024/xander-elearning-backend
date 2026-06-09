@@ -7,16 +7,27 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration {
     public function up(): void
     {
+        if (!Schema::hasTable('students')) {
+            return;
+        }
+
         Schema::table('students', function (Blueprint $table) {
-            // Place primary_goal at the end of the table to avoid relying on specific existing columns
-            $table->text('primary_goal')->nullable();
+            if (!Schema::hasColumn('students', 'primary_goal')) {
+                $table->text('primary_goal')->nullable();
+            }
         });
     }
 
     public function down(): void
     {
+        if (!Schema::hasTable('students')) {
+            return;
+        }
+
         Schema::table('students', function (Blueprint $table) {
-            $table->dropColumn('primary_goal');
+            if (Schema::hasColumn('students', 'primary_goal')) {
+                $table->dropColumn('primary_goal');
+            }
         });
     }
 };
