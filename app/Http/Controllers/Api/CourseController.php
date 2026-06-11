@@ -9,22 +9,27 @@ use App\Models\User;
 use App\Models\CourseEnrollment;
 use App\Models\Student;
 use App\Models\CourseMaterial;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Log;
 use App\Mail\CourseAppliedMail;
 use App\Mail\CourseEnrollmentApprovedMail;
 use App\Mail\CourseEnrollmentRejectedMail;
 use App\Mail\CourseClassScheduledMail;
 use App\Mail\StaffClassScheduledMail;
+use App\Services\MailDeliveryService;
 use App\Services\ZoomService;
+use App\Support\CourseMaterialHelper;
+use Carbon\Carbon;
 
 class CourseController extends Controller
 {
     protected ZoomService $zoom;
 
-    public function __construct(ZoomService $zoom)
+    protected MailDeliveryService $mail;
+
+    public function __construct(ZoomService $zoom, MailDeliveryService $mail)
     {
         $this->zoom = $zoom;
+        $this->mail = $mail;
     }
     public function index()
     {
@@ -161,17 +166,13 @@ class CourseController extends Controller
         ]);
 
         // Send notification email to the student about the course application
-        try {
-            $student = Student::find($data['student_id']);
-            if ($student && $student->email) {
-                Mail::to($student->email)->send(new CourseAppliedMail($student, $course, $enrollment->level));
-            }
-        } catch (\Throwable $e) {
-            Log::error('Failed to send course application email', [
-                'student_id' => $data['student_id'],
-                'course_id' => $course->id,
-                'error' => $e->getMessage(),
-            ]);
+        $student = Student::find($data['student_id']);
+        if ($student && $student->email) {
+            $this->mail->sendTo(
+                $student->email,
+                new CourseAppliedMail($student, $course, $enrollment->level),
+                ['event' => 'course_applied', 'student_id' => $data['student_id'], 'course_id' => $course->id]
+            );
         }
 
         return response()->json([
@@ -180,38 +181,116 @@ class CourseController extends Controller
         ], 201);
     }
 
+    /**
+     * Admin approves a learner's course application so they can pay via Stripe.
+     */
+    public function approveEnrollment(Request $request, Course $course)
+    {
+        $data = $request->validate([
+            'student_id' => 'required|exists:students,id',
+        ]);
+
+        $enrollment = CourseEnrollment::where('student_id', $data['student_id'])
+            ->where('course_id', $course->id)
+            ->first();
+
+        if (!$enrollment) {
+            return response()->json([
+                'message' => 'Enrollment not found for this student and course.',
+            ], 404);
+        }
+
+        if ($enrollment->status === 'rejected') {
+            return response()->json([
+                'message' => 'This enrollment was rejected and cannot be approved.',
+            ], 422);
+        }
+
+        if (in_array($enrollment->status, ['paid', 'completed'], true)) {
+            return response()->json([
+                'message' => 'This enrollment is already active.',
+            ], 422);
+        }
+
+        $enrollment->status = 'approved';
+        $enrollment->save();
+
+        $student = Student::find($data['student_id']);
+        if ($student && $student->email) {
+            $this->mail->sendTo(
+                $student->email,
+                new CourseEnrollmentApprovedMail($student, $course),
+                ['event' => 'enrollment_approved', 'student_id' => $data['student_id'], 'course_id' => $course->id]
+            );
+        }
+
+        return response()->json([
+            'message' => 'Enrollment approved. The learner can now complete payment.',
+            'enrollment' => $enrollment,
+        ]);
+    }
+
     public function scheduleClass(Request $request, Course $course)
     {
         $data = $request->validate([
             'start_time' => 'required|date',
+            'instructor_email' => 'nullable|email',
+            'topic' => 'nullable|string|max:255',
+            'duration' => 'nullable|integer|min:15|max:480',
+            'timezone' => 'nullable|string|max:64',
             'zoom_link' => 'nullable|url',
             'notes' => 'nullable|string',
             'staff_id' => 'nullable|exists:users,id',
             'notify_only' => 'nullable|boolean',
+            'join_before_host' => 'nullable|boolean',
+            'mute_upon_entry' => 'nullable|boolean',
+            'auto_recording' => 'nullable|boolean',
         ]);
+
+        $instructor = null;
+        if (!empty($data['instructor_email'])) {
+            $instructor = User::query()
+                ->where('email', $data['instructor_email'])
+                ->where('role', 'instructor')
+                ->first();
+
+            if (!$instructor) {
+                return response()->json(['message' => 'Instructor not found.'], 404);
+            }
+
+            if (!$instructor->assignedCourses()->where('courses.id', $course->id)->exists()) {
+                return response()->json([
+                    'message' => 'You are not assigned to this course. Ask an administrator to assign it in Course Management.',
+                ], 403);
+            }
+        }
 
         $zoomJoinLink = $data['zoom_link'] ?? null;
         $zoomStartUrl = null;
+        $zoomMeetingId = null;
 
-        // If no Zoom link provided, create a Zoom meeting using the logged-in instructor as host
         if (!$zoomJoinLink) {
-            $user = $request->user();
-            $hostId = $user && !empty($user->email)
-                ? (string) $user->email
-                : (string) config('services.zoom.host_user_id', 'me');
+            $hostId = (string) config('services.zoom.host_user_id', 'me');
+            $topic = trim((string) ($data['topic'] ?? '')) ?: ($course->title ?? 'Course Class');
 
             $zoomPayload = [
-                'topic'      => $course->title ?? 'Course Class',
+                'topic' => $topic,
                 'start_time' => $data['start_time'],
-                'agenda'     => $data['notes'] ?? '',
+                'duration' => $data['duration'] ?? 60,
+                'timezone' => $data['timezone'] ?? config('app.timezone', 'UTC'),
+                'agenda' => $data['notes'] ?? '',
+                'join_before_host' => (bool) ($data['join_before_host'] ?? false),
+                'waiting_room' => !((bool) ($data['join_before_host'] ?? false)),
+                'mute_upon_entry' => (bool) ($data['mute_upon_entry'] ?? true),
+                'auto_recording' => (bool) ($data['auto_recording'] ?? false),
             ];
 
             $zoomData = $this->zoom->createMeeting($zoomPayload, $hostId);
 
             if ($zoomData === null) {
                 return response()->json([
-                    'message' => 'Unable to create Zoom meeting for this class.',
-                ], 500);
+                    'message' => 'Zoom API is not configured. Add ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET to .env.',
+                ], 503);
             }
 
             if (isset($zoomData['error']) && !empty($zoomData['error'])) {
@@ -226,6 +305,7 @@ class CourseController extends Controller
 
             $zoomJoinLink = $zoomData['join_url'] ?? null;
             $zoomStartUrl = $zoomData['start_url'] ?? null;
+            $zoomMeetingId = $zoomData['id'] ?? null;
 
             if (!$zoomJoinLink) {
                 return response()->json([
@@ -235,52 +315,86 @@ class CourseController extends Controller
             }
         }
 
-        // Notify staff / instructor about this scheduled class (no learner emails here)
-        try {
-            $staff = null;
-            if (!empty($data['staff_id'])) {
-                $staff = User::find($data['staff_id']);
-            } elseif ($request->user()) {
-                $staff = $request->user();
-            }
+        $staff = null;
+        if (!empty($data['staff_id'])) {
+            $staff = User::find($data['staff_id']);
+        } elseif ($instructor) {
+            $staff = $instructor;
+        } elseif ($request->user()) {
+            $staff = $request->user();
+        }
 
-            if ($staff && !empty($staff->email)) {
-                Mail::to($staff->email)->send(
-                    new StaffClassScheduledMail(
-                        $staff,
-                        $course,
-                        $data['start_time'],
-                        $zoomJoinLink,
-                        $data['notes'] ?? null
-                    )
-                );
-            }
-        } catch (\Throwable $e) {
-            Log::error('Failed to send staff class schedule email', [
+        if ($staff && !empty($staff->email)) {
+            $this->mail->sendTo(
+                $staff->email,
+                new StaffClassScheduledMail(
+                    $staff,
+                    $course,
+                    $data['start_time'],
+                    $zoomJoinLink,
+                    $data['notes'] ?? null
+                ),
+                ['event' => 'staff_class_scheduled', 'course_id' => $course->id, 'staff_id' => $staff->id]
+            );
+        }
+
+        $notifyOnly = !empty($data['notify_only']);
+        $material = null;
+        if (!$notifyOnly) {
+            $materialTitle = trim((string) ($data['topic'] ?? '')) ?: ('Live class - ' . Carbon::parse($data['start_time'])->format('M j, Y g:i A'));
+            $material = CourseMaterial::create([
                 'course_id' => $course->id,
-                'staff_id' => $data['staff_id'] ?? null,
-                'error' => $e->getMessage(),
+                'title' => $materialTitle,
+                'description' => $data['notes'] ?? null,
+                'type' => 'zoom',
+                'resource_url' => $zoomJoinLink,
+                'scheduled_at' => $data['start_time'],
+                'metadata' => [
+                    'join_url' => $zoomJoinLink,
+                    'start_url' => $zoomStartUrl,
+                    'meeting_id' => $zoomMeetingId,
+                    'duration' => $data['duration'] ?? 60,
+                    'timezone' => $data['timezone'] ?? config('app.timezone', 'UTC'),
+                ],
+                'sort_order' => 0,
             ]);
         }
 
-        // Optionally avoid creating a CourseMaterial entry if this is just a notification
-        $notifyOnly = !empty($data['notify_only']);
-        if (!$notifyOnly) {
-            $materialTitle = 'Zoom session - ' . $data['start_time'];
-            CourseMaterial::create([
-                'course_id'    => $course->id,
-                'title'        => $materialTitle,
-                'description'  => $data['notes'] ?? null,
-                'type'         => 'zoom',
-                'resource_url' => $zoomStartUrl ?? $zoomJoinLink,
-                'sort_order'   => 0,
-            ]);
+        $notifiedCount = 0;
+        $learners = CourseEnrollment::query()
+            ->with('student')
+            ->where('course_id', $course->id)
+            ->whereIn('status', ['paid', 'completed'])
+            ->get();
+
+        foreach ($learners as $enrollment) {
+            $student = $enrollment->student;
+            if (!$student || empty($student->email)) {
+                continue;
+            }
+
+            if ($this->mail->sendTo(
+                $student->email,
+                new CourseClassScheduledMail(
+                    $student,
+                    $course,
+                    $data['start_time'],
+                    $zoomJoinLink,
+                    $data['notes'] ?? null
+                ),
+                ['event' => 'learner_class_scheduled', 'course_id' => $course->id, 'student_id' => $student->id]
+            )) {
+                $notifiedCount++;
+            }
         }
 
         return response()->json([
-            'message' => 'Class scheduled, Zoom meeting prepared, and staff notified (where possible).',
+            'message' => 'Class scheduled via Zoom API. Learners have been notified where possible.',
             'zoom_join_url' => $zoomJoinLink,
             'zoom_start_url' => $zoomStartUrl,
+            'zoom_meeting_id' => $zoomMeetingId,
+            'students_notified' => $notifiedCount,
+            'material' => $material ? CourseMaterialHelper::toLearnerArray($material) : null,
         ]);
     }
 
@@ -302,11 +416,17 @@ class CourseController extends Controller
                 'last_name' => $student->last_name ?? null,
                 'name' => $student->name ?? trim(($student->first_name ?? '') . ' ' . ($student->last_name ?? '')),
                 'email' => $student->email,
+                'enrollment_status' => $enrollment->status,
             ];
         })->filter()->values();
 
+        $notifyableCount = $students->filter(
+            fn ($s) => in_array(strtolower((string) ($s['enrollment_status'] ?? '')), ['paid', 'completed'], true)
+        )->count();
+
         return response()->json([
             'students' => $students,
+            'notifyable_count' => $notifyableCount,
         ]);
     }
 
@@ -326,21 +446,23 @@ class CourseController extends Controller
             ], 404);
         }
 
+        if (!in_array($enrollment->status, ['approved', 'paid'], true)) {
+            return response()->json([
+                'message' => 'Enrollment must be approved by an administrator before payment can be recorded.',
+            ], 422);
+        }
+
         $enrollment->status = 'paid';
         $enrollment->save();
 
         // Notify learner that their enrollment has been approved/activated
-        try {
-            $student = Student::find($data['student_id']);
-            if ($student && $student->email) {
-                Mail::to($student->email)->send(new CourseEnrollmentApprovedMail($student, $course));
-            }
-        } catch (\Throwable $e) {
-            Log::error('Failed to send course enrollment approved email', [
-                'student_id' => $data['student_id'],
-                'course_id' => $course->id,
-                'error' => $e->getMessage(),
-            ]);
+        $student = Student::find($data['student_id']);
+        if ($student && $student->email) {
+            $this->mail->sendTo(
+                $student->email,
+                new CourseEnrollmentApprovedMail($student, $course),
+                ['event' => 'enrollment_approved', 'student_id' => $data['student_id'], 'course_id' => $course->id]
+            );
         }
 
         return response()->json([
@@ -369,20 +491,13 @@ class CourseController extends Controller
         $enrollment->status = 'rejected';
         $enrollment->save();
 
-        // Notify learner that their enrollment was rejected with optional reason
-        try {
-            $student = Student::find($data['student_id']);
-            if ($student && $student->email) {
-                Mail::to($student->email)->send(
-                    new CourseEnrollmentRejectedMail($student, $course, $data['reason'] ?? null)
-                );
-            }
-        } catch (\Throwable $e) {
-            Log::error('Failed to send course enrollment rejected email', [
-                'student_id' => $data['student_id'],
-                'course_id' => $course->id,
-                'error' => $e->getMessage(),
-            ]);
+        $student = Student::find($data['student_id']);
+        if ($student && $student->email) {
+            $this->mail->sendTo(
+                $student->email,
+                new CourseEnrollmentRejectedMail($student, $course, $data['reason'] ?? null),
+                ['event' => 'enrollment_rejected', 'student_id' => $data['student_id'], 'course_id' => $course->id]
+            );
         }
 
         return response()->json([

@@ -15,7 +15,14 @@ class CourseMaterial extends Model
         'description',
         'type',
         'resource_url',
+        'scheduled_at',
+        'metadata',
         'sort_order',
+    ];
+
+    protected $casts = [
+        'metadata' => 'array',
+        'scheduled_at' => 'datetime',
     ];
 
     public function course()

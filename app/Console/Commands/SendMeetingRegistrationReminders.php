@@ -3,9 +3,9 @@
 namespace App\Console\Commands;
 
 use App\Models\MeetingRegistration;
+use App\Services\MailDeliveryService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
 use Carbon\Carbon;
 
@@ -15,7 +15,7 @@ class SendMeetingRegistrationReminders extends Command
 
     protected $description = 'Send reminder emails for approved meeting registrations 5 minutes before their scheduled start time';
 
-    public function handle(): int
+    public function handle(MailDeliveryService $mail): int
     {
         if (!Schema::hasColumn('meeting_registrations', 'zoom_start_time') || !Schema::hasColumn('meeting_registrations', 'reminder_sent_at')) {
             $this->warn('Required columns missing (zoom_start_time/reminder_sent_at).');
@@ -90,7 +90,7 @@ class SendMeetingRegistrationReminders extends Command
 
                     $effectiveJoinUrl = $reg->zoom_join_url ?: (string) config('services.pathways_webinar.zoom_join_url');
 
-                    Mail::send('emails.meeting_registration_reminder', [
+                    $sentOk = $mail->sendView('emails.meeting_registration_reminder', [
                         'appName' => config('app.name'),
                         'name' => $reg->full_name ?? '',
                         'joinUrl' => $effectiveJoinUrl,
@@ -98,13 +98,20 @@ class SendMeetingRegistrationReminders extends Command
                         'customMessage' => null,
                     ], function ($messageObj) use ($reg) {
                         $messageObj->to($reg->email)->subject('Reminder: Your scheduled session is starting soon');
-                    });
+                    }, [
+                        'event' => 'meeting_registration_reminder_cron',
+                        'meeting_registration_id' => $reg->id,
+                    ]);
+
+                    if (!$sentOk) {
+                        continue;
+                    }
 
                     $reg->reminder_sent_at = now();
                     $reg->save();
                     $sent++;
                 } catch (\Throwable $e) {
-                    Log::warning('Failed to send automatic meeting registration reminder', [
+                    Log::warning('Failed to prepare automatic meeting registration reminder', [
                         'meeting_registration_id' => $reg->id,
                         'error' => $e->getMessage(),
                     ]);

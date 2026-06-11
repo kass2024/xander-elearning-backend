@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use App\Models\User;
 use App\Models\CourseMaterial;
+use App\Models\CourseEnrollment;
 
 class Course extends Model
 {
@@ -34,5 +35,10 @@ class Course extends Model
     public function materials()
     {
         return $this->hasMany(CourseMaterial::class);
+    }
+
+    public function enrollments()
+    {
+        return $this->hasMany(CourseEnrollment::class);
     }
 }

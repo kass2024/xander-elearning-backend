@@ -203,12 +203,15 @@
             @endif
 
             <div class="button-wrapper">
-                <a href="{{ config('app.frontend_url') ?? '#' }}" class="primary-button" target="_blank">
-                    Open your learner dashboard
+                @php
+                    $loginUrl = rtrim((string) config('app.frontend_url', config('app.url')), '/') . '/login';
+                @endphp
+                <a href="{{ $loginUrl }}" class="primary-button" target="_blank">
+                    Sign in to your learner dashboard
                 </a>
                 <p class="note">
                     If the button does not work, copy and paste this link into your browser:<br>
-                    <span>{{ config('app.frontend_url') ?? '#' }}</span>
+                    <span>{{ $loginUrl }}</span>
                 </p>
             </div>
 

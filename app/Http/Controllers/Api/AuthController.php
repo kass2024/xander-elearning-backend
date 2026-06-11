@@ -8,11 +8,10 @@ use App\Models\User;
 use App\Models\Agent;
 use App\Models\Student;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Mail;
-use App\Mail\StudentRegisteredMail;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use App\Services\StudentRegistrationEmailService;
 
 class AuthController extends Controller
 {
@@ -74,6 +73,10 @@ class AuthController extends Controller
             $student = new Student();
             $student->first_name = $data['first_name'];
             $student->last_name = $data['last_name'] ?? null;
+            $student->name = trim($data['first_name'] . ' ' . ($data['last_name'] ?? ''));
+            if ($student->name === '') {
+                $student->name = $data['email'];
+            }
             $student->email = $data['email'];
             // Table columns: status, phone, country, primary_goal are NOT NULL with no default
             // New learners start as Pending until approved in dashboard/students
@@ -85,16 +88,12 @@ class AuthController extends Controller
             $student->password = Hash::make($plainPassword);
             $student->save();
 
-            // Try to send welcome / notification email to the student
-            try {
-                $selectedCourses = $data['selected_courses'] ?? [];
-                Mail::to($student->email)->send(new StudentRegisteredMail($student, $plainPassword, $selectedCourses));
-            } catch (\Throwable $mailException) {
-                Log::error('Failed to send registration email', [
-                    'error' => $mailException->getMessage(),
-                ]);
-                // Do not block signup if email fails; just log the error.
-            }
+            $selectedCourses = $data['selected_courses'] ?? [];
+            $emailSent = app(StudentRegistrationEmailService::class)->sendWelcomeEmail(
+                $student,
+                $plainPassword,
+                $selectedCourses
+            );
 
             DB::commit();
 
@@ -102,6 +101,8 @@ class AuthController extends Controller
                 'message' => 'Student registered',
                 'role' => 'learner',
                 'user' => $student,
+                'email_sent' => $emailSent,
+                'pending_approval' => true,
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -112,6 +113,44 @@ class AuthController extends Controller
 
             return response()->json([
                 'message' => 'Failed to create account due to a server error. Please try again later.',
+            ], 500);
+        }
+    }
+
+    public function registerInstructor(Request $request)
+    {
+        $data = $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|email|unique:users,email',
+            'password' => 'required|string|min:6',
+            'phone' => 'nullable|string|max:50',
+            'country' => 'nullable|string|max:255',
+            'primary_goal' => 'nullable|string|max:500',
+        ]);
+
+        try {
+            $user = User::create([
+                'name' => $data['name'],
+                'email' => $data['email'],
+                'password' => Hash::make($data['password']),
+                'role' => 'instructor',
+                'status' => 'Pending',
+                'phone' => $data['phone'] ?? '',
+            ]);
+
+            return response()->json([
+                'message' => 'Instructor application submitted',
+                'role' => 'instructor',
+                'user' => $user->makeHidden(['password']),
+                'pending_approval' => true,
+            ], 201);
+        } catch (\Throwable $e) {
+            Log::error('Failed to register instructor', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'message' => 'Failed to submit instructor application. Please try again later.',
             ], 500);
         }
     }
@@ -149,6 +188,13 @@ class AuthController extends Controller
             ->orWhere('last_name', $username)
             ->first();
         if ($student && $verify($student)) {
+            $studentStatus = strtolower(trim((string) ($student->status ?? 'active')));
+            if (in_array($studentStatus, ['pending', 'inactive', 'rejected'], true)) {
+                return response()->json([
+                    'message' => 'Your account is pending admin approval. You will be able to sign in once an administrator approves your registration.',
+                ], 403);
+            }
+
             return response()->json([
                 'message' => 'Login successful',
                 'role' => 'learner',
@@ -156,9 +202,24 @@ class AuthController extends Controller
             ]);
         }
 
-        // Then try Users table (e.g. admin/other staff)
+        // Users table (admin, staff, instructors, etc.)
         $user = User::where('email', $username)->orWhere('name', $username)->first();
         if ($user && $verify($user)) {
+            $userStatus = strtolower(trim((string) ($user->status ?? 'active')));
+            $userRole = strtolower(trim((string) ($user->role ?? 'admin')));
+
+            if ($userRole === 'instructor' && in_array($userStatus, ['pending', 'inactive', 'rejected'], true)) {
+                return response()->json([
+                    'message' => 'Your instructor application is pending approval. We will email you when your account is activated.',
+                ], 403);
+            }
+
+            if (in_array($userStatus, ['inactive', 'rejected'], true)) {
+                return response()->json([
+                    'message' => 'Your account is not active. Please contact support.',
+                ], 403);
+            }
+
             return response()->json([
                 'message' => 'Login successful',
                 'role' => $user->role ?? 'admin',
@@ -166,7 +227,7 @@ class AuthController extends Controller
             ]);
         }
 
-        // Finally, try Agents table (treated as instructors)
+        // Legacy agents table (instructors)
         $agent = Agent::where('email', $username)->orWhere('name', $username)->first();
         if ($agent && $verify($agent)) {
             return response()->json([

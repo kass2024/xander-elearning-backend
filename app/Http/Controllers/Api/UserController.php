@@ -119,16 +119,18 @@ class UserController extends Controller
             ], 403);
         }
 
-        if (!empty($data['password'])) {
-            $data['password'] = Hash::make($data['password']);
-        }
-
         if (empty($data['role'])) {
             if ($currentUser && $currentUser->role === 'staff') {
                 $data['role'] = 'staff';
             } else {
                 $data['role'] = 'admin';
             }
+        }
+
+        if (!empty($data['password'])) {
+            $data['password'] = Hash::make($data['password']);
+        } elseif ($data['role'] === 'instructor') {
+            $data['password'] = Hash::make('12345678');
         }
 
         if (empty($data['status'])) {

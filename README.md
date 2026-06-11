@@ -4,22 +4,53 @@ Laravel API for **Xander Learning Hub** (courses, students, Zoom, Stripe).
 
 ## Database migrations (automated schema)
 
-All table changes live in `database/migrations/`. On any server:
+All table changes live in `database/migrations/`. **No manual SQL is required.**
+
+### Automatic (recommended)
+
+Set in `.env`:
+
+```env
+AUTO_MIGRATE=true
+```
+
+When the API starts, pending migrations run automatically (`AppServiceProvider`).
+
+### Manual / production deploy
 
 ```bash
 php artisan migrate --force
 ```
 
+Or call the API after deploy:
+
+```bash
+curl -X POST "https://your-api/api/admin/system/migrate" \
+  -H "X-Migrate-Token: YOUR_MIGRATE_TOKEN"
+```
+
+Set `MIGRATE_TOKEN` in production `.env` to protect the migrate endpoint.
+
+### Health check
+
+```bash
+curl "http://localhost:8000/api/admin/system/health"
+```
+
+Returns database connectivity, pending migrations, and per-table column verification.
+
 Migrations use `Schema::hasTable()` / `Schema::hasColumn()` guards so they are safe on fresh installs and existing production databases.
 
 | Area | Migration files |
 |------|-----------------|
-| Users (role, phone, status, avatar) | `0001_*`, `2025_11_17_*`, `2025_11_11_*`, `2026_01_23_180000_*` |
-| Students | `2025_11_05_*`, `2025_11_23_*` |
+| Users (role, phone, status, avatar) | `0001_*`, `2025_11_17_*`, `2026_01_23_180000_*` |
+| Students (approval, profile) | `2025_11_05_*`, `2025_11_07_*`, `2025_11_23_*` |
+| Instructors (users.role + status Pending) | `2025_11_17_000600_*`, `2026_01_23_180000_*` |
 | Courses & enrollments | `2025_11_17_*`, `2025_11_18_*`, `2025_11_28_*` |
-| Meeting registrations | `2026_01_23_*`, `2026_06_09_120200_*` (sync) |
+| Stripe payments | `2026_06_09_120100_*` |
+| Full hub sync (idempotent) | `2026_06_11_120000_sync_elearning_hub_schema.php` |
+| Meeting registrations | `2026_01_23_*`, `2026_06_09_120200_*` |
 | Live Zoom cohort | `2026_06_09_120000_*` |
-| Stripe payments log | `2026_06_09_120100_*` |
 | Zoom / Stripe env | `.env` — `ZOOM_*`, `STRIPE_*` |
 
 ## Deploy checklist

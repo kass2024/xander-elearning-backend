@@ -31,7 +31,7 @@ class StudentRegisteredMail extends Mailable
      */
     public function build(): self
     {
-        return $this->subject('Your Parrot learner account & application received')
+        return $this->subject('Your Xander Learning Hub account & login credentials')
             ->view('emails.student_registered')
             ->with([
                 'student' => $this->student,

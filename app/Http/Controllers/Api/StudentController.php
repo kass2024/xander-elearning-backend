@@ -5,9 +5,8 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use App\Models\Student;
-use Illuminate\Support\Facades\Mail;
-use Illuminate\Support\Facades\Log;
-use App\Mail\StudentRegisteredMail;
+use App\Services\MailDeliveryService;
+use App\Services\StudentRegistrationEmailService;
 
 class StudentController extends Controller
 {
@@ -33,6 +32,7 @@ class StudentController extends Controller
         $student = Student::create([
             'first_name' => $validated['first_name'],
             'last_name'  => $validated['last_name'],
+            'name'       => trim($validated['first_name'] . ' ' . $validated['last_name']) ?: $validated['email'],
             'email'      => $validated['email'],
             'status'     => $validated['status'] ?? 'Active',
             // ensure NOT NULL columns always get a value
@@ -43,17 +43,13 @@ class StudentController extends Controller
             'password'   => '12345678',
         ]);
 
-        // Try to send welcome email with default password and any selected courses
-        try {
-            $selectedCourses = $validated['selected_courses'] ?? [];
-            Mail::to($student->email)->send(new StudentRegisteredMail($student, '12345678', $selectedCourses));
-        } catch (\Throwable $e) {
-            Log::error('Failed to send student registration email from StudentController@store', [
-                'student_id' => $student->id,
-                'error' => $e->getMessage(),
-            ]);
-            // Do not fail the request if email fails here
-        }
+        // Send welcome email with default password and any selected courses
+        $selectedCourses = $validated['selected_courses'] ?? [];
+        app(StudentRegistrationEmailService::class)->sendWelcomeEmail(
+            $student,
+            '12345678',
+            $selectedCourses
+        );
 
         return response()->json(['message' => 'Student created', 'student' => $student], 201);
     }
@@ -112,32 +108,27 @@ class StudentController extends Controller
         ], 201);
     }
 
-    public function testEmail(Request $request)
+    public function testEmail(Request $request, MailDeliveryService $mail)
     {
         $request->validate([
             'email' => 'required|email',
         ]);
 
         $toEmail = $request->input('email');
+        $result = $mail->sendTest($toEmail);
+        $diagnosis = $mail->diagnose();
 
-        try {
-            Mail::send('emails.welcome', ['student' => null, 'password' => null], function ($message) use ($toEmail) {
-                $message->to($toEmail)
-                    ->subject('Test email from Parrot-Canada');
-            });
-
+        if ($result['ok']) {
             return response()->json([
-                'message' => 'Email send request done (check inbox/spam).',
+                'message' => $result['message'],
+                'diagnosis' => $diagnosis,
             ]);
-        } catch (\Throwable $e) {
-            Log::error('Failed to send test email', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'message' => 'Failed to send email.',
-                'error' => $e->getMessage(),
-            ], 500);
         }
+
+        return response()->json([
+            'message' => 'Failed to send email.',
+            'error' => $result['error'],
+            'diagnosis' => $diagnosis,
+        ], 500);
     }
 }

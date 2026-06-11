@@ -15,6 +15,11 @@ use App\Http\Controllers\Api\MeetingRegistrationController;
 use App\Http\Controllers\Api\AvailableScheduleController;
 use App\Http\Controllers\Api\LiveZoomCohortController;
 use App\Http\Controllers\Api\PaymentController;
+use App\Http\Controllers\Api\AdminReportsController;
+use App\Http\Controllers\Api\SystemController;
+use App\Http\Controllers\Api\InstructorDashboardController;
+use App\Http\Controllers\Api\LearnerDashboardController;
+use App\Http\Controllers\Api\CertificateController;
 use App\Services\ZoomService;
 
 /*
@@ -29,9 +34,14 @@ use App\Services\ZoomService;
 */
 
 Route::prefix('admin')->group(function () {
+    // System / schema (run before other routes on new servers)
+    Route::get('system/health', [SystemController::class, 'health']);
+    Route::post('system/migrate', [SystemController::class, 'migrate']);
+
     // Auth
     Route::post('auth/login', [AuthController::class, 'login']);
     Route::post('auth/register-student', [AuthController::class, 'registerStudent']);
+    Route::post('auth/register-instructor', [AuthController::class, 'registerInstructor']);
     Route::patch('auth/profile', [AuthController::class, 'updateProfile']);
     Route::post('auth/change-password', [AuthController::class, 'changePassword']);
     Route::get('auth/google/redirect', [AuthController::class, 'redirectToGoogle']);
@@ -114,11 +124,31 @@ Route::prefix('admin')->group(function () {
     Route::get('students/{student}/course-enrollments', [CourseController::class, 'studentEnrollments']);
     Route::get('students/{student}/dashboard-summary', [StudentDashboardController::class, 'summary']);
     Route::get('learner/dashboard-extras', [LearnerExtrasController::class, 'index']);
+    Route::get('learner/dashboard', [LearnerDashboardController::class, 'dashboard']);
+    Route::get('learner/notifications', [LearnerDashboardController::class, 'notifications']);
+    Route::get('learner/recordings', [LearnerDashboardController::class, 'recordings']);
+    Route::get('learner/courses/{course}/materials', [CourseMaterialController::class, 'learnerIndex']);
+
+    Route::get('certificates/verify/{courseId}/{studentId}', [CertificateController::class, 'verify'])
+        ->whereNumber('courseId')
+        ->whereNumber('studentId');
 
     /*** ---------------- USERS (ADMIN) ---------------- ***/
     Route::get('users', [UserController::class, 'index']);
     Route::get('instructors-with-courses', [UserController::class, 'instructorsWithCourses']);
     Route::get('instructor-assigned-courses', [UserController::class, 'instructorAssignedCourses']);
+
+    /*** ---------------- INSTRUCTOR DASHBOARD ---------------- ***/
+    Route::get('instructor/dashboard', [InstructorDashboardController::class, 'dashboard']);
+    Route::get('instructor/live-classes', [InstructorDashboardController::class, 'liveClasses']);
+    Route::post('instructor/live-classes/{material}/start', [InstructorDashboardController::class, 'startLiveSession']);
+    Route::get('instructor/students', [InstructorDashboardController::class, 'students']);
+    Route::get('instructor/quizzes', [InstructorDashboardController::class, 'quizzes']);
+    Route::post('instructor/quizzes', [InstructorDashboardController::class, 'storeQuiz']);
+    Route::post('instructor/courses', [InstructorDashboardController::class, 'createCourse']);
+    Route::get('instructor/payout-requests', [InstructorDashboardController::class, 'payoutRequests']);
+    Route::post('instructor/payout-requests', [InstructorDashboardController::class, 'requestPayout']);
+
     Route::post('users', [UserController::class, 'store']);
     Route::put('users/{user}', [UserController::class, 'update']);
     Route::delete('users/{user}', [UserController::class, 'destroy']);
@@ -147,6 +177,7 @@ Route::prefix('admin')->group(function () {
 
     // Dashboard metrics
     Route::get('dashboard/metrics', [ProgramManagementController::class, 'getDashboardMetrics']);
+    Route::get('dashboard/analytics', [AdminReportsController::class, 'analytics']);
 
     /*** ---------------- COURSES ---------------- ***/
     Route::get('courses', [CourseController::class, 'index']);
@@ -156,6 +187,7 @@ Route::prefix('admin')->group(function () {
     Route::post('courses/{course}/assign', [CourseController::class, 'assignToUser']);
     Route::post('courses/{course}/unassign', [CourseController::class, 'unassignFromUser']);
     Route::post('courses/{course}/enroll', [CourseController::class, 'enroll']);
+    Route::post('courses/{course}/approve-enrollment', [CourseController::class, 'approveEnrollment']);
     Route::post('courses/{course}/schedule-class', [CourseController::class, 'scheduleClass']);
     Route::post('courses/{course}/mark-paid', [CourseController::class, 'markPaid']);
     Route::post('courses/{course}/reject-enrollment', [CourseController::class, 'rejectEnrollment']);
@@ -169,7 +201,11 @@ Route::prefix('admin')->group(function () {
     Route::post('courses/{course}/materials/upload-document', [CourseMaterialController::class, 'uploadDocument']);
 
     /*** ---------------- PAYMENTS ---------------- ***/
+    Route::get('payments', [PaymentController::class, 'index']);
+    Route::get('payments/stripe-config', [PaymentController::class, 'stripeConfig']);
+    Route::patch('payments/{payment}', [PaymentController::class, 'updateStatus']);
     Route::post('payments/create-checkout', [PaymentController::class, 'createCheckout']);
+    Route::post('payments/confirm-checkout', [PaymentController::class, 'confirmCheckout']);
     Route::post('payments/create-intent', [PaymentController::class, 'createIntent']);
 
     /*** ---------------- ZOOM ---------------- ***/

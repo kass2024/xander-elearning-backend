@@ -114,9 +114,8 @@ class ZoomService
             // If a password is provided, pass it through to Zoom; otherwise Zoom can auto-generate one
             'password'   => $data['password'] ?? null,
             'settings'   => [
-                // Force participants to wait for the host and be admitted from the waiting room
-                'join_before_host'              => false,
-                'waiting_room'                  => true,
+                'join_before_host'              => (bool) ($data['join_before_host'] ?? false),
+                'waiting_room'                  => (bool) ($data['waiting_room'] ?? !($data['join_before_host'] ?? false)),
                 'mute_upon_entry'               => $data['mute_upon_entry'] ?? true,
                 'auto_recording'                => ($data['auto_recording'] ?? false) ? 'cloud' : 'none',
                 'host_video'                    => $data['host_video'] ?? true,
@@ -150,6 +149,51 @@ class ZoomService
 
         $response = $client->delete("/meetings/{$meetingId}");
         return !$response->failed();
+    }
+
+    /**
+     * Zoom meeting IDs currently in progress for the account host user.
+     *
+     * @return array<int, string>
+     */
+    public function fetchLiveMeetingIds(string $userId = 'me'): array
+    {
+        $cacheKey = 'zoom_live_meeting_ids_' . $userId;
+
+        return Cache::remember($cacheKey, 20, function () use ($userId) {
+            $client = $this->client();
+            if (!$client) {
+                return [];
+            }
+
+            $response = $client->get("/users/{$userId}/meetings", [
+                'type' => 'live',
+                'page_size' => 100,
+            ]);
+
+            if ($response->failed()) {
+                return [];
+            }
+
+            $meetings = $response->json('meetings') ?? [];
+
+            return collect($meetings)
+                ->pluck('id')
+                ->filter()
+                ->map(fn ($id) => (string) $id)
+                ->values()
+                ->all();
+        });
+    }
+
+    public function isMeetingLive(string $meetingId, string $userId = 'me'): bool
+    {
+        $meetingId = trim($meetingId);
+        if ($meetingId === '') {
+            return false;
+        }
+
+        return in_array($meetingId, $this->fetchLiveMeetingIds($userId), true);
     }
 
     public function listWebinars(string $userId = 'me'): ?array

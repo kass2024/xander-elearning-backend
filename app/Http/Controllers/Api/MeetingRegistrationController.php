@@ -11,8 +11,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
+use App\Services\MailDeliveryService;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
@@ -20,9 +20,12 @@ class MeetingRegistrationController extends Controller
 {
     protected ZoomService $zoom;
 
-    public function __construct(ZoomService $zoom)
+    protected MailDeliveryService $mail;
+
+    public function __construct(ZoomService $zoom, MailDeliveryService $mail)
     {
         $this->zoom = $zoom;
+        $this->mail = $mail;
     }
 
     private function getNextWebinarStartTime(): Carbon
@@ -268,7 +271,7 @@ class MeetingRegistrationController extends Controller
                 $learnerNotes = null;
             }
 
-            Mail::send('emails.meeting_registration_approved', [
+            $this->mail->sendView('emails.meeting_registration_approved', [
                 'appName' => config('app.name'),
                 'name' => $meetingRegistration->full_name ?? '',
                 'joinUrl' => $joinUrl,
@@ -277,9 +280,13 @@ class MeetingRegistrationController extends Controller
                 'learnerNotes' => $learnerNotes,
             ], function ($message) use ($to) {
                 $message->to($to)->subject('Pathways Webinar Schedule & Zoom Link');
-            });
+            }, [
+                'event' => 'meeting_registration_approved',
+                'meeting_registration_id' => $meetingRegistration->id ?? null,
+                'to' => $to,
+            ]);
         } catch (\Throwable $e) {
-            Log::warning('Failed to send meeting registration approved webinar email', [
+            Log::warning('Failed to prepare meeting registration approved webinar email', [
                 'meeting_registration_id' => $meetingRegistration->id ?? null,
                 'to' => $to,
                 'error' => $e->getMessage(),
@@ -329,23 +336,19 @@ class MeetingRegistrationController extends Controller
             $nextSessionText = $nextStart ? ($nextStart->format('Y-m-d H:i') . ' (' . $tz . ')') : null;
         }
 
-        try {
-            Mail::send('emails.meeting_registration_reminder', [
-                'appName' => config('app.name'),
-                'name' => $meetingRegistration->full_name ?? '',
-                'joinUrl' => $effectiveJoinUrl,
-                'nextSession' => $nextSessionText,
-                'customMessage' => $message,
-            ], function ($messageObj) use ($to) {
-                $messageObj->to($to)->subject('Reminder: Pathways Webinar & Zoom Link');
-            });
-        } catch (\Throwable $e) {
-            Log::warning('Failed to send meeting registration reminder email', [
-                'meeting_registration_id' => $meetingRegistration->id ?? null,
-                'to' => $to,
-                'error' => $e->getMessage(),
-            ]);
-        }
+        $this->mail->sendView('emails.meeting_registration_reminder', [
+            'appName' => config('app.name'),
+            'name' => $meetingRegistration->full_name ?? '',
+            'joinUrl' => $effectiveJoinUrl,
+            'nextSession' => $nextSessionText,
+            'customMessage' => $message,
+        ], function ($messageObj) use ($to) {
+            $messageObj->to($to)->subject('Reminder: Pathways Webinar & Zoom Link');
+        }, [
+            'event' => 'meeting_registration_reminder',
+            'meeting_registration_id' => $meetingRegistration->id ?? null,
+            'to' => $to,
+        ]);
     }
 
     private function sendStatusEmail(MeetingRegistration $meetingRegistration, string $status, ?string $reason = null, ?string $joinUrl = null, ?string $frontendScheduleLabel = null): void
@@ -357,13 +360,17 @@ class MeetingRegistrationController extends Controller
 
         try {
             if (strtolower($status) === 'rejected') {
-                Mail::send('emails.meeting_registration_rejected', [
+                $this->mail->sendView('emails.meeting_registration_rejected', [
                     'appName' => config('app.name'),
                     'name' => $meetingRegistration->full_name ?? '',
                     'reason' => $reason,
                 ], function ($message) use ($to) {
                     $message->to($to)->subject('Meeting Registration Rejected');
-                });
+                }, [
+                    'event' => 'meeting_registration_rejected',
+                    'meeting_registration_id' => $meetingRegistration->id ?? null,
+                    'to' => $to,
+                ]);
             } elseif (strtolower($status) === 'approved') {
                 $effectiveJoinUrl = $joinUrl;
                 if (!$effectiveJoinUrl && !empty($meetingRegistration->zoom_join_url)) {
@@ -427,7 +434,7 @@ class MeetingRegistrationController extends Controller
                     $learnerNotes = null;
                 }
 
-                Mail::send('emails.meeting_registration_approved', [
+                $this->mail->sendView('emails.meeting_registration_approved', [
                     'appName' => config('app.name'),
                     'name' => $meetingRegistration->full_name ?? '',
                     'joinUrl' => $effectiveJoinUrl,
@@ -436,7 +443,11 @@ class MeetingRegistrationController extends Controller
                     'learnerNotes' => $learnerNotes,
                 ], function ($message) use ($to) {
                     $message->to($to)->subject('Pathways Webinar Schedule & Zoom Link');
-                });
+                }, [
+                    'event' => 'meeting_registration_approved',
+                    'meeting_registration_id' => $meetingRegistration->id ?? null,
+                    'to' => $to,
+                ]);
             } else {
                 $subject = 'Meeting Registration ' . $status;
                 $lines = [];
@@ -447,12 +458,17 @@ class MeetingRegistrationController extends Controller
                 $lines[] = 'Thank you,';
                 $lines[] = config('app.name');
 
-                Mail::raw(implode("\n", $lines), function ($message) use ($to, $subject) {
+                $this->mail->sendRaw(implode("\n", $lines), function ($message) use ($to, $subject) {
                     $message->to($to)->subject($subject);
-                });
+                }, [
+                    'event' => 'meeting_registration_status',
+                    'meeting_registration_id' => $meetingRegistration->id ?? null,
+                    'to' => $to,
+                    'status' => $status,
+                ]);
             }
         } catch (\Throwable $e) {
-            Log::warning('Failed to send meeting registration status email', [
+            Log::warning('Failed to prepare meeting registration status email', [
                 'meeting_registration_id' => $meetingRegistration->id ?? null,
                 'to' => $to,
                 'status' => $status,

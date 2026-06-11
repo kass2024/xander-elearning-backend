@@ -3,10 +3,10 @@
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Schedule;
 use App\Models\MeetingRegistration;
+use App\Services\MailDeliveryService;
 use Carbon\Carbon;
 
 Artisan::command('inspire', function () {
@@ -63,7 +63,8 @@ Artisan::command('meeting-registrations:send-reminders', function () {
             $nextSessionText = $startAt->format('Y-m-d H:i') . ' (' . $tz . ')';
             $effectiveJoinUrl = $reg->zoom_join_url ?: (string) config('services.pathways_webinar.zoom_join_url');
 
-            Mail::send('emails.meeting_registration_reminder', [
+            $mail = app(MailDeliveryService::class);
+            $sentOk = $mail->sendView('emails.meeting_registration_reminder', [
                 'appName' => config('app.name'),
                 'name' => $reg->full_name ?? '',
                 'joinUrl' => $effectiveJoinUrl,
@@ -71,13 +72,20 @@ Artisan::command('meeting-registrations:send-reminders', function () {
                 'customMessage' => null,
             ], function ($messageObj) use ($reg) {
                 $messageObj->to($reg->email)->subject('Reminder: Your scheduled session is starting soon');
-            });
+            }, [
+                'event' => 'meeting_registration_reminder_schedule',
+                'meeting_registration_id' => $reg->id,
+            ]);
+
+            if (!$sentOk) {
+                continue;
+            }
 
             $reg->reminder_sent_at = now();
             $reg->save();
             $sent++;
         } catch (\Throwable $e) {
-            Log::warning('Failed to send automatic meeting registration reminder', [
+            Log::warning('Failed to prepare automatic meeting registration reminder', [
                 'meeting_registration_id' => $reg->id,
                 'error' => $e->getMessage(),
             ]);

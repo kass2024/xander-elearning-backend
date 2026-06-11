@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Services\MailDeliveryService;
 use App\Services\ZoomService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 
@@ -13,9 +13,12 @@ class ZoomController extends Controller
 {
     protected ZoomService $zoom;
 
-    public function __construct(ZoomService $zoom)
+    protected MailDeliveryService $mail;
+
+    public function __construct(ZoomService $zoom, MailDeliveryService $mail)
     {
         $this->zoom = $zoom;
+        $this->mail = $mail;
     }
 
     public function listMeetings()
@@ -166,16 +169,12 @@ class ZoomController extends Controller
                     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
                         continue;
                     }
-                    try {
-                        Mail::raw($bodyText, function ($message) use ($email, $subject) {
-                            $message->to($email)->subject($subject);
-                        });
-                    } catch (\Throwable $ex) {
-                        Log::error('Failed to send Zoom invite email', [
-                            'email' => $email,
-                            'error' => $ex->getMessage(),
-                        ]);
-                    }
+                    $this->mail->sendRaw($bodyText, function ($message) use ($email, $subject) {
+                        $message->to($email)->subject($subject);
+                    }, [
+                        'event' => 'zoom_invite',
+                        'email' => $email,
+                    ]);
                 }
             }
         }
