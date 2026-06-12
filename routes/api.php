@@ -58,6 +58,7 @@ Route::prefix('admin')->group(function () {
     Route::post('meeting-registrations/{meetingRegistration}/approve', [MeetingRegistrationController::class, 'approve']);
     Route::post('meeting-registrations/{meetingRegistration}/reject', [MeetingRegistrationController::class, 'reject']);
     Route::post('meeting-registrations/{meetingRegistration}/remind', [MeetingRegistrationController::class, 'remind']);
+    Route::post('meeting-registrations/{meetingRegistration}/resend-join-link', [MeetingRegistrationController::class, 'resendJoinLink']);
     Route::delete('meeting-registrations/{meetingRegistration}', [MeetingRegistrationController::class, 'destroy']);
 
     // Available Schedule (Time Slots)
