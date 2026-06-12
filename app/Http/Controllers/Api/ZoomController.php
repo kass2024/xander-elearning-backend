@@ -51,28 +51,26 @@ class ZoomController extends Controller
             ], 200);
         }
 
-        $data = $this->zoom->listRecordings($this->zoom->hostUserId());
-
-        if ($data === null) {
-            return response()->json(['message' => 'Unable to contact Zoom for recordings'], 500);
-        }
-
-        if (is_array($data) && !empty($data['error']) && isset($data['status'])) {
-            return response()->json([
-                'message' => 'Zoom recordings API error',
-                'zoom_status' => $data['status'],
-                'zoom_body' => $data['body'] ?? null,
-            ], (int) $data['status']);
-        }
+        $trackedIds = AdminRecordingCatalog::trackedMeetingIds();
+        $collected = $this->zoom->collectAllCloudRecordings($trackedIds, 12);
 
         $items = AdminRecordingCatalog::annotateItems(
-            $this->zoom->formatRecordingItems($data)
+            $this->zoom->formatRecordingItems(['meetings' => $collected['meetings']])
         );
+
+        $scopeHint = null;
+        if ($items === [] && $collected['errors'] !== []) {
+            $scopeHint = 'Add Zoom scopes cloud_recording:read:list_user_recordings:admin and cloud_recording:read:list_recording_files:admin to your Server-to-Server app, then re-activate it.';
+        }
 
         return response()->json([
             'recordings' => $items,
             'zoom_api_configured' => true,
             'total' => count($items),
+            'tracked_meeting_ids' => count($trackedIds),
+            'load_strategies' => $collected['strategies'],
+            'zoom_errors' => $collected['errors'],
+            'scope_hint' => $scopeHint,
         ], 200);
     }
 

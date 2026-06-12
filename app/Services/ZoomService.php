@@ -127,6 +127,240 @@ class ZoomService
         return ['meetings' => $meetings];
     }
 
+    public function accountId(): string
+    {
+        return $this->accountId;
+    }
+
+    public function encodeMeetingIdForPath(string $meetingId): string
+    {
+        $meetingId = trim($meetingId);
+        if ($meetingId === '') {
+            return '';
+        }
+
+        if (str_contains($meetingId, '/') || str_starts_with($meetingId, '+') || str_contains($meetingId, '//')) {
+            return rawurlencode(rawurlencode($meetingId));
+        }
+
+        return rawurlencode($meetingId);
+    }
+
+    /**
+     * Cloud recordings for a single meeting (works when list-user-recordings scope is missing).
+     */
+    public function getMeetingRecordings(string $meetingId): ?array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return null;
+        }
+
+        $encoded = $this->encodeMeetingIdForPath($meetingId);
+        if ($encoded === '') {
+            return null;
+        }
+
+        $response = $client->get("/meetings/{$encoded}/recordings");
+
+        if ($response->status() === 404) {
+            return null;
+        }
+
+        if ($response->failed()) {
+            return [
+                'error' => true,
+                'status' => $response->status(),
+                'body' => $response->json(),
+            ];
+        }
+
+        return $response->json();
+    }
+
+    /**
+     * Account-level cloud recording list (requires account recording scopes).
+     */
+    public function listAccountRecordings(int $monthsBack = 12): ?array
+    {
+        $client = $this->client();
+        if (!$client || $this->accountId === '') {
+            return null;
+        }
+
+        $encodedAccount = rawurlencode($this->accountId);
+        $meetingsByKey = [];
+
+        for ($i = 0; $i < max(1, $monthsBack); $i++) {
+            $month = now()->subMonths($i);
+            $from = $month->copy()->startOfMonth()->format('Y-m-d');
+            $to = $i === 0
+                ? now()->format('Y-m-d')
+                : $month->copy()->endOfMonth()->format('Y-m-d');
+
+            $nextPageToken = null;
+
+            do {
+                $params = [
+                    'from' => $from,
+                    'to' => $to,
+                    'page_size' => 300,
+                ];
+
+                if ($nextPageToken) {
+                    $params['next_page_token'] = $nextPageToken;
+                }
+
+                $response = $client->get("/accounts/{$encodedAccount}/recordings", $params);
+
+                if ($response->failed()) {
+                    return [
+                        'error' => true,
+                        'status' => $response->status(),
+                        'body' => $response->json(),
+                    ];
+                }
+
+                $page = $response->json();
+
+                foreach (($page['meetings'] ?? []) as $meeting) {
+                    $key = (string) ($meeting['uuid'] ?? $meeting['id'] ?? md5(json_encode($meeting)));
+                    $meetingsByKey[$key] = $meeting;
+                }
+
+                $nextPageToken = $page['next_page_token'] ?? null;
+            } while (!empty($nextPageToken));
+        }
+
+        return ['meetings' => array_values($meetingsByKey)];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function hostUserCandidates(): array
+    {
+        $candidates = array_values(array_unique(array_filter([
+            $this->hostUserId(),
+            'me',
+        ])));
+
+        return $candidates;
+    }
+
+    /**
+     * Fetch cloud recordings using every available Zoom API strategy.
+     *
+     * @param  list<string>  $meetingIds
+     * @return array{meetings: list<array<string, mixed>>, errors: list<string>, strategies: list<string>}
+     */
+    public function collectAllCloudRecordings(array $meetingIds = [], int $monthsBack = 12): array
+    {
+        $meetingsByKey = [];
+        $errors = [];
+        $strategies = [];
+
+        $merge = function (?array $payload, string $strategy) use (&$meetingsByKey, &$strategies, &$errors): void {
+            if ($payload === null) {
+                return;
+            }
+
+            if (!empty($payload['error'])) {
+                $message = $payload['body']['message'] ?? ('HTTP ' . ($payload['status'] ?? '?'));
+                $errors[] = $strategy . ': ' . $message;
+
+                return;
+            }
+
+            $count = 0;
+            foreach (($payload['meetings'] ?? []) as $meeting) {
+                if (!is_array($meeting)) {
+                    continue;
+                }
+                $normalized = $this->normalizeRecordingMeeting($meeting);
+                if (empty($normalized['recording_files'])) {
+                    continue;
+                }
+                $key = (string) ($normalized['uuid'] ?? $normalized['id'] ?? md5(json_encode($normalized)));
+                $meetingsByKey[$key] = $normalized;
+                $count++;
+            }
+
+            if ($count > 0) {
+                $strategies[] = $strategy . ' (' . $count . ')';
+            }
+        };
+
+        foreach ($this->hostUserCandidates() as $host) {
+            $merge($this->listRecordings($host, $monthsBack), 'user:' . $host);
+        }
+
+        $merge($this->listAccountRecordings($monthsBack), 'account');
+
+        foreach (array_unique(array_filter(array_map('strval', $meetingIds))) as $meetingId) {
+            $single = $this->getMeetingRecordings($meetingId);
+            if ($single === null) {
+                continue;
+            }
+            if (!empty($single['error'])) {
+                $message = $single['body']['message'] ?? ('HTTP ' . ($single['status'] ?? '?'));
+                $errors[] = 'meeting:' . $meetingId . ': ' . $message;
+                continue;
+            }
+
+            $normalized = $this->normalizeRecordingMeeting($single);
+            if (empty($normalized['recording_files'])) {
+                continue;
+            }
+
+            $key = (string) ($normalized['uuid'] ?? $normalized['id'] ?? $meetingId);
+            $meetingsByKey[$key] = $normalized;
+            $strategies[] = 'meeting:' . $meetingId;
+        }
+
+        $meetings = array_values($meetingsByKey);
+        usort($meetings, function (array $a, array $b) {
+            return strcmp((string) ($b['start_time'] ?? ''), (string) ($a['start_time'] ?? ''));
+        });
+
+        return [
+            'meetings' => $meetings,
+            'errors' => array_values(array_unique($errors)),
+            'strategies' => $strategies,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $meeting
+     * @return array<string, mixed>
+     */
+    public function normalizeRecordingMeeting(array $meeting): array
+    {
+        $files = [];
+        foreach (($meeting['recording_files'] ?? []) as $file) {
+            if (!is_array($file)) {
+                continue;
+            }
+            $files[] = [
+                'id' => $file['id'] ?? null,
+                'recording_type' => $file['recording_type'] ?? null,
+                'file_type' => $file['file_type'] ?? null,
+                'play_url' => $file['play_url'] ?? null,
+                'download_url' => $file['download_url'] ?? null,
+                'status' => $file['status'] ?? null,
+            ];
+        }
+
+        return [
+            'uuid' => $meeting['uuid'] ?? null,
+            'id' => $meeting['id'] ?? null,
+            'topic' => $meeting['topic'] ?? 'Recorded session',
+            'start_time' => $meeting['start_time'] ?? null,
+            'duration' => $meeting['duration'] ?? null,
+            'recording_files' => $files,
+        ];
+    }
+
     public function hostUserId(): string
     {
         return (string) config('services.zoom.host_user_id', 'me');
@@ -441,14 +675,15 @@ class ZoomService
      */
     public function recordingsGroupedByMeetingId(?string $userId = null): array
     {
-        $data = $this->listRecordings($userId ?: $this->hostUserId());
-        if ($data === null || !empty($data['error'])) {
+        $tracked = array_keys(\App\Support\AdminRecordingCatalog::sourceByMeetingId());
+        $data = $this->collectAllCloudRecordings($tracked, 12);
+        if (empty($data['meetings'])) {
             return [];
         }
 
         $grouped = [];
 
-        foreach (($data['meetings'] ?? []) as $meeting) {
+        foreach ($data['meetings'] as $meeting) {
             $meetingId = (string) ($meeting['id'] ?? '');
             if ($meetingId === '') {
                 continue;
@@ -487,22 +722,21 @@ class ZoomService
      */
     public function formatRecordingItems(?array $zoomListResponse): array
     {
-        if ($zoomListResponse === null || !empty($zoomListResponse['error'])) {
+        if ($zoomListResponse === null) {
+            return [];
+        }
+
+        if (!empty($zoomListResponse['error'])) {
             return [];
         }
 
         $items = [];
 
         foreach (($zoomListResponse['meetings'] ?? []) as $meeting) {
+            $normalized = $this->normalizeRecordingMeeting(is_array($meeting) ? $meeting : []);
             $files = [];
-            foreach (($meeting['recording_files'] ?? []) as $file) {
-                $files[] = [
-                    'id' => $file['id'] ?? null,
-                    'recording_type' => $file['recording_type'] ?? null,
-                    'file_type' => $file['file_type'] ?? null,
-                    'play_url' => $file['play_url'] ?? null,
-                    'download_url' => $file['download_url'] ?? null,
-                ];
+            foreach (($normalized['recording_files'] ?? []) as $file) {
+                $files[] = $file;
             }
 
             if (empty($files)) {
@@ -510,11 +744,11 @@ class ZoomService
             }
 
             $items[] = [
-                'uuid' => $meeting['uuid'] ?? null,
-                'id' => $meeting['id'] ?? null,
-                'topic' => $meeting['topic'] ?? 'Recorded session',
-                'start_time' => $meeting['start_time'] ?? null,
-                'duration' => $meeting['duration'] ?? null,
+                'uuid' => $normalized['uuid'] ?? null,
+                'id' => $normalized['id'] ?? null,
+                'topic' => $normalized['topic'] ?? 'Recorded session',
+                'start_time' => $normalized['start_time'] ?? null,
+                'duration' => $normalized['duration'] ?? null,
                 'files' => $files,
             ];
         }

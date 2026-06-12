@@ -877,22 +877,11 @@ class MeetingRegistrationController extends Controller
     public function webinarRecordings()
     {
         $settings = WebinarSetting::current();
-        $meetingId = $settings->zoom_meeting_id;
 
-        $data = $this->zoom->listRecordings($this->zoom->hostUserId());
-        if ($data === null) {
-            return response()->json(['message' => 'Unable to contact Zoom for recordings'], 503);
-        }
-
-        if (!empty($data['error'])) {
-            return response()->json([
-                'message' => 'Zoom recordings API error',
-                'details' => $data['body'] ?? null,
-            ], 502);
-        }
-
+        $trackedIds = AdminRecordingCatalog::trackedMeetingIds();
+        $collected = $this->zoom->collectAllCloudRecordings($trackedIds, 12);
         $items = AdminRecordingCatalog::annotateItems(
-            $this->zoom->formatRecordingItems($data)
+            $this->zoom->formatRecordingItems(['meetings' => $collected['meetings']])
         );
 
         $webinarMeetingIds = array_keys(array_filter(
@@ -904,9 +893,10 @@ class MeetingRegistrationController extends Controller
             $items = array_values(array_filter($items, function ($item) use ($webinarMeetingIds) {
                 return in_array((string) ($item['id'] ?? ''), $webinarMeetingIds, true);
             }));
-        } elseif ($meetingId) {
+        } elseif (!empty($settings->zoom_meeting_id)) {
+            $meetingId = (string) $settings->zoom_meeting_id;
             $items = array_values(array_filter($items, function ($item) use ($meetingId) {
-                return (string) ($item['id'] ?? '') === (string) $meetingId;
+                return (string) ($item['id'] ?? '') === $meetingId;
             }));
         }
 

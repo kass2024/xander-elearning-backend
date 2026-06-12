@@ -54,6 +54,16 @@ class AdminRecordingCatalog
         return $map;
     }
 
+    /**
+     * All Zoom meeting IDs we know about from pathways/webinars and live classes.
+     *
+     * @return list<string>
+     */
+    public static function trackedMeetingIds(): array
+    {
+        return array_values(array_unique(array_keys(self::sourceByMeetingId())));
+    }
+
     public static function sourceLabel(string $source): string
     {
         return match ($source) {
