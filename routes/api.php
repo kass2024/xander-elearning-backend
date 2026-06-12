@@ -219,6 +219,7 @@ Route::prefix('admin')->group(function () {
     Route::post('zoom/meetings/{id}/recording', [ZoomController::class, 'setMeetingRecording']);
     Route::delete('zoom/meetings/{id}', [ZoomController::class, 'deleteMeeting']);
     Route::get('zoom/recordings', [ZoomController::class, 'listRecordings']);
+    Route::get('zoom/recordings/stream', [ZoomController::class, 'streamRecording']);
     Route::get('zoom/webinars', [ZoomController::class, 'listWebinars']);
     Route::post('zoom/webinars', [ZoomController::class, 'createWebinar']);
 

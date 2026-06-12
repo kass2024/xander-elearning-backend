@@ -64,6 +64,17 @@ class AdminRecordingCatalog
         return array_values(array_unique(array_keys(self::sourceByMeetingId())));
     }
 
+    /**
+     * @param  list<array<string, mixed>>  $items
+     * @return list<array<string, mixed>>
+     */
+    public static function filterPlatformOnly(array $items): array
+    {
+        return array_values(array_filter($items, function (array $item) {
+            return in_array($item['source'] ?? '', ['webinar', 'live_class'], true);
+        }));
+    }
+
     public static function sourceLabel(string $source): string
     {
         return match ($source) {
@@ -84,6 +95,16 @@ class AdminRecordingCatalog
         return array_map(function (array $item) use ($sourceMap) {
             $meetingId = (string) ($item['id'] ?? '');
             $source = $sourceMap[$meetingId] ?? 'other';
+            $topic = strtolower((string) ($item['topic'] ?? ''));
+
+            if ($source === 'other' && str_contains($topic, 'pathways webinar')) {
+                $source = 'webinar';
+            }
+
+            if ($source === 'other' && (str_contains($topic, 'live class') || str_contains($topic, 'zoom session'))) {
+                $source = 'live_class';
+            }
+
             $item['source'] = $source;
             $item['source_label'] = self::sourceLabel($source);
 

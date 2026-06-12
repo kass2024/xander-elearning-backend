@@ -54,8 +54,10 @@ class ZoomController extends Controller
         $trackedIds = AdminRecordingCatalog::trackedMeetingIds();
         $collected = $this->zoom->collectAllCloudRecordings($trackedIds, 12);
 
-        $items = AdminRecordingCatalog::annotateItems(
-            $this->zoom->formatRecordingItems(['meetings' => $collected['meetings']])
+        $items = AdminRecordingCatalog::filterPlatformOnly(
+            AdminRecordingCatalog::annotateItems(
+                $this->zoom->formatRecordingItems(['meetings' => $collected['meetings']])
+            )
         );
 
         $scopeHint = null;
@@ -72,6 +74,47 @@ class ZoomController extends Controller
             'zoom_errors' => $collected['errors'],
             'scope_hint' => $scopeHint,
         ], 200);
+    }
+
+    public function streamRecording(Request $request)
+    {
+        $request->validate([
+            'url' => 'required|url|max:4000',
+        ]);
+
+        $url = (string) $request->query('url');
+        $range = $request->header('Range');
+        $response = $this->zoom->fetchRecordingStream($url, $range);
+
+        if ($response === null) {
+            return response()->json(['message' => 'Unable to stream this recording'], 502);
+        }
+
+        if ($response->failed()) {
+            return response()->json([
+                'message' => 'Zoom rejected the recording stream request',
+                'status' => $response->status(),
+            ], $response->status());
+        }
+
+        $forwardHeaders = [];
+        foreach (['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges'] as $header) {
+            $value = $response->header($header);
+            if ($value) {
+                $forwardHeaders[$header] = $value;
+            }
+        }
+
+        return response()->stream(function () use ($response) {
+            $body = $response->toPsrResponse()->getBody();
+            while (!$body->eof()) {
+                echo $body->read(1024 * 64);
+                if (ob_get_level() > 0) {
+                    ob_flush();
+                }
+                flush();
+            }
+        }, $response->status(), $forwardHeaders);
     }
 
     public function createMeeting(Request $request)

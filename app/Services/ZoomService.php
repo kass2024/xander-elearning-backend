@@ -371,6 +371,92 @@ class ZoomService
         return $this->accountId !== '' && $this->clientId !== '' && $this->clientSecret !== '';
     }
 
+    public function isAllowedRecordingUrl(string $url): bool
+    {
+        $host = parse_url($url, PHP_URL_HOST);
+
+        return is_string($host) && preg_match('/(^|\.)zoom\.us$/i', $host) === 1;
+    }
+
+    public function recordingAccessToken(): ?string
+    {
+        return $this->getAccessToken();
+    }
+
+    /**
+     * @return \Illuminate\Http\Client\Response|null
+     */
+    public function fetchRecordingStream(string $url, ?string $range = null)
+    {
+        if (!$this->isAllowedRecordingUrl($url)) {
+            return null;
+        }
+
+        $token = $this->getAccessToken();
+        if (!$token) {
+            return null;
+        }
+
+        return Http::withToken($token)
+            ->withHeaders(array_filter(['Range' => $range]))
+            ->withOptions(['stream' => true])
+            ->timeout(300)
+            ->get($url);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $files
+     * @return list<array<string, mixed>>
+     */
+    public function filterPlayableRecordingFiles(array $files): array
+    {
+        $allowedFileTypes = ['MP4', 'M4A'];
+        $blockedRecordingTypes = ['timeline', 'transcript', 'chat', 'cc', 'caption', 'summary'];
+
+        $filtered = array_values(array_filter($files, function (array $file) use ($allowedFileTypes, $blockedRecordingTypes) {
+            $fileType = strtoupper((string) ($file['file_type'] ?? ''));
+            if (!in_array($fileType, $allowedFileTypes, true)) {
+                return false;
+            }
+
+            $recordingType = strtolower((string) ($file['recording_type'] ?? ''));
+            foreach ($blockedRecordingTypes as $blocked) {
+                if (str_contains($recordingType, $blocked)) {
+                    return false;
+                }
+            }
+
+            return !empty($file['download_url']) || !empty($file['play_url']);
+        }));
+
+        usort($filtered, function (array $a, array $b) {
+            $score = function (array $file): int {
+                $type = strtolower((string) ($file['recording_type'] ?? ''));
+                if (strtoupper((string) ($file['file_type'] ?? '')) === 'M4A') {
+                    return 10;
+                }
+                if (str_contains($type, 'shared_screen_with_speaker_view')) {
+                    return 100;
+                }
+                if (str_contains($type, 'shared_screen_with_gallery_view')) {
+                    return 90;
+                }
+                if (str_contains($type, 'active_speaker')) {
+                    return 80;
+                }
+                if (str_contains($type, 'gallery_view')) {
+                    return 70;
+                }
+
+                return 50;
+            };
+
+            return $score($b) <=> $score($a);
+        });
+
+        return $filtered;
+    }
+
     /**
      * Legacy personal-meeting links cannot be updated via the Meetings API.
      */
@@ -749,11 +835,11 @@ class ZoomService
                 'topic' => $normalized['topic'] ?? 'Recorded session',
                 'start_time' => $normalized['start_time'] ?? null,
                 'duration' => $normalized['duration'] ?? null,
-                'files' => $files,
+                'files' => $this->filterPlayableRecordingFiles($files),
             ];
         }
 
-        return $items;
+        return array_values(array_filter($items, fn (array $item) => !empty($item['files'])));
     }
 }
 
