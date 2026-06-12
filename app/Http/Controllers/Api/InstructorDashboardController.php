@@ -6,14 +6,13 @@ use App\Http\Controllers\Controller;
 use App\Models\Course;
 use App\Models\CourseEnrollment;
 use App\Models\CourseMaterial;
-use App\Models\CoursePayment;
 use App\Models\InstructorPayoutRequest;
 use App\Models\User;
 use App\Support\CourseMaterialHelper;
+use App\Support\CourseRevenueCalculator;
 use App\Services\ZoomService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 
 class InstructorDashboardController extends Controller
 {
@@ -41,17 +40,7 @@ class InstructorDashboardController extends Controller
 
     private function courseRevenue(Course $course): float
     {
-        $stripeRevenue = CoursePayment::query()
-            ->where('course_id', $course->id)
-            ->whereIn('status', ['paid', 'succeeded', 'completed'])
-            ->sum('amount_cents') / 100;
-
-        $paidCount = CourseEnrollment::query()
-            ->where('course_id', $course->id)
-            ->where('status', 'paid')
-            ->count();
-
-        return round($stripeRevenue + ((float) ($course->price ?? 0) * $paidCount), 2);
+        return CourseRevenueCalculator::courseRevenue($course);
     }
 
     public function dashboard(Request $request)
@@ -134,37 +123,19 @@ class InstructorDashboardController extends Controller
             'count' => (int) ($enrollmentRows[$month] ?? 0),
         ])->values();
 
+        $courseIdList = $courseIds->all();
+        $since = $now->copy()->subMonths(5)->startOfMonth();
+
         $paymentRows = $courseIds->isEmpty()
             ? collect()
-            : CoursePayment::query()
-                ->selectRaw("DATE_FORMAT(COALESCE(paid_at, created_at), '%Y-%m') as month, SUM(amount_cents) as total_cents")
-                ->whereIn('course_id', $courseIds)
-                ->whereIn('status', ['paid', 'succeeded', 'completed'])
-                ->where(function ($q) use ($now) {
-                    $q->where('paid_at', '>=', $now->copy()->subMonths(5)->startOfMonth())
-                        ->orWhere(function ($q2) use ($now) {
-                            $q2->whereNull('paid_at')
-                                ->where('created_at', '>=', $now->copy()->subMonths(5)->startOfMonth());
-                        });
-                })
-                ->groupBy('month')
-                ->pluck('total_cents', 'month');
+            : CourseRevenueCalculator::monthlyPaymentRevenue($since, $courseIdList);
 
-        $paidEnrollmentRows = $courseIds->isEmpty()
+        $manualEnrollmentRows = $courseIds->isEmpty()
             ? collect()
-            : CourseEnrollment::query()
-                ->join('courses', 'courses.id', '=', 'course_enrollments.course_id')
-                ->selectRaw("DATE_FORMAT(course_enrollments.updated_at, '%Y-%m') as month, SUM(COALESCE(courses.price, 0)) as total")
-                ->whereIn('course_enrollments.course_id', $courseIds)
-                ->where('course_enrollments.status', 'paid')
-                ->where('course_enrollments.updated_at', '>=', $now->copy()->subMonths(5)->startOfMonth())
-                ->groupBy('month')
-                ->pluck('total', 'month');
+            : CourseRevenueCalculator::monthlyManualEnrollmentRevenue($since, $courseIdList);
 
-        $earningsByMonth = $months->map(function ($month) use ($paymentRows, $paidEnrollmentRows, $share) {
-            $stripe = ((int) ($paymentRows[$month] ?? 0)) / 100;
-            $manual = (float) ($paidEnrollmentRows[$month] ?? 0);
-            $revenue = $stripe + $manual;
+        $earningsByMonth = $months->map(function ($month) use ($paymentRows, $manualEnrollmentRows, $share) {
+            $revenue = (float) ($paymentRows[$month] ?? 0) + (float) ($manualEnrollmentRows[$month] ?? 0);
 
             return [
                 'month' => Carbon::createFromFormat('Y-m', $month)->format('M Y'),

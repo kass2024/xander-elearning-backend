@@ -10,8 +10,8 @@ use App\Models\InstructorPayoutRequest;
 use App\Models\MeetingRegistration;
 use App\Models\Student;
 use App\Models\User;
+use App\Support\CourseRevenueCalculator;
 use Carbon\Carbon;
-use Illuminate\Support\Facades\DB;
 
 class AdminReportsController extends Controller
 {
@@ -33,36 +33,7 @@ class AdminReportsController extends Controller
             'count' => (int) ($enrollmentRows[$month] ?? 0),
         ])->values();
 
-        $paymentRows = CoursePayment::query()
-            ->selectRaw("DATE_FORMAT(COALESCE(paid_at, created_at), '%Y-%m') as month, SUM(amount_cents) as total_cents")
-            ->whereIn('status', ['paid', 'succeeded', 'completed'])
-            ->where(function ($q) use ($now) {
-                $q->where('paid_at', '>=', $now->copy()->subMonths(5)->startOfMonth())
-                    ->orWhere(function ($q2) use ($now) {
-                        $q2->whereNull('paid_at')
-                            ->where('created_at', '>=', $now->copy()->subMonths(5)->startOfMonth());
-                    });
-            })
-            ->groupBy('month')
-            ->pluck('total_cents', 'month');
-
-        $paidEnrollmentRows = CourseEnrollment::query()
-            ->join('courses', 'courses.id', '=', 'course_enrollments.course_id')
-            ->selectRaw("DATE_FORMAT(course_enrollments.updated_at, '%Y-%m') as month, SUM(COALESCE(courses.price, 0)) as total")
-            ->where('course_enrollments.status', 'paid')
-            ->where('course_enrollments.updated_at', '>=', $now->copy()->subMonths(5)->startOfMonth())
-            ->groupBy('month')
-            ->pluck('total', 'month');
-
-        $revenueByMonth = $months->map(function ($month) use ($paymentRows, $paidEnrollmentRows) {
-            $stripe = ((int) ($paymentRows[$month] ?? 0)) / 100;
-            $manual = (float) ($paidEnrollmentRows[$month] ?? 0);
-
-            return [
-                'month' => Carbon::createFromFormat('Y-m', $month)->format('M Y'),
-                'amount' => round($stripe + $manual, 2),
-            ];
-        })->values();
+        $revenueByMonth = CourseRevenueCalculator::revenueByMonth(5);
 
         $instructorPerformance = User::query()
             ->where('role', 'instructor')
@@ -98,11 +69,6 @@ class AdminReportsController extends Controller
             ->orderByDesc('total_enrollments')
             ->get()
             ->map(function (Course $course) {
-                $stripeRevenue = CoursePayment::query()
-                    ->where('course_id', $course->id)
-                    ->whereIn('status', ['paid', 'succeeded', 'completed'])
-                    ->sum('amount_cents') / 100;
-
                 return [
                     'id' => $course->id,
                     'title' => $course->title,
@@ -110,7 +76,7 @@ class AdminReportsController extends Controller
                     'price' => (float) ($course->price ?? 0),
                     'total_enrollments' => (int) $course->total_enrollments,
                     'paid_enrollments' => (int) $course->paid_enrollments,
-                    'revenue' => round($stripeRevenue + ((float) ($course->price ?? 0) * (int) $course->paid_enrollments), 2),
+                    'revenue' => CourseRevenueCalculator::courseRevenue($course),
                 ];
             })
             ->values();
@@ -127,14 +93,8 @@ class AdminReportsController extends Controller
             ])
             ->values();
 
-        $stripeRevenue = CoursePayment::query()
-            ->whereIn('status', ['paid', 'succeeded', 'completed'])
-            ->sum('amount_cents') / 100;
-
-        $manualRevenue = CourseEnrollment::query()
-            ->join('courses', 'courses.id', '=', 'course_enrollments.course_id')
-            ->where('course_enrollments.status', 'paid')
-            ->sum(DB::raw('COALESCE(courses.price, 0)'));
+        $stripeRevenue = CourseRevenueCalculator::paymentRevenue();
+        $manualRevenue = CourseRevenueCalculator::manualEnrollmentRevenue();
 
         $pendingInstructors = User::query()
             ->where('role', 'instructor')
@@ -172,8 +132,9 @@ class AdminReportsController extends Controller
                 'totalInstructors' => User::where('role', 'instructor')->count(),
                 'totalEnrollments' => CourseEnrollment::count(),
                 'paidEnrollments' => CourseEnrollment::where('status', 'paid')->count(),
-                'totalRevenue' => round($stripeRevenue + (float) $manualRevenue, 2),
+                'totalRevenue' => CourseRevenueCalculator::totalRevenue(),
                 'stripeRevenue' => round($stripeRevenue, 2),
+                'manualRevenue' => round($manualRevenue, 2),
                 'pendingInstructors' => $pendingInstructors,
                 'pendingCourses' => $pendingCourses,
                 'pendingPayments' => $pendingPayments,
