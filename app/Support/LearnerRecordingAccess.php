@@ -4,6 +4,7 @@ namespace App\Support;
 
 use App\Models\CourseEnrollment;
 use App\Models\CourseMaterial;
+use App\Models\WebinarSetting;
 use App\Services\ZoomService;
 
 class LearnerRecordingAccess
@@ -13,14 +14,33 @@ class LearnerRecordingAccess
         return app(ZoomService::class)->pathwaysMeetingId();
     }
 
+    /**
+     * @return array<int, string>
+     */
+    public static function excludedWebinarMeetingIds(): array
+    {
+        $ids = [];
+
+        $legacy = self::pathwaysMeetingId();
+        if ($legacy) {
+            $ids[] = (string) $legacy;
+        }
+
+        $settings = WebinarSetting::current();
+        if (!empty($settings->zoom_meeting_id)) {
+            $ids[] = (string) $settings->zoom_meeting_id;
+        }
+
+        return array_values(array_unique($ids));
+    }
+
     public static function isPathwaysWebinarMeeting(?string $meetingId): bool
     {
-        $pathwaysId = self::pathwaysMeetingId();
-        if (!$pathwaysId || !$meetingId) {
+        if (!$meetingId) {
             return false;
         }
 
-        return (string) $meetingId === (string) $pathwaysId;
+        return in_array((string) $meetingId, self::excludedWebinarMeetingIds(), true);
     }
 
     public static function hasPaidAccessToCourse(int $studentId, int $courseId): bool

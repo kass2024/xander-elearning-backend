@@ -396,7 +396,7 @@ class InstructorDashboardController extends Controller
         $meetingId = CourseMaterialHelper::meetingId($material);
         $meta = is_array($material->metadata) ? $material->metadata : [];
 
-        if ($enableRecording && $meetingId) {
+        if ($enableRecording && $meetingId && $this->zoom->canManageMeetingViaApi($meetingId)) {
             $result = $this->zoom->setMeetingAutoRecording($meetingId, true);
             if ($result === null) {
                 return response()->json([
@@ -409,6 +409,9 @@ class InstructorDashboardController extends Controller
                     'details' => $result['body'] ?? null,
                 ], 502);
             }
+        }
+
+        if ($enableRecording) {
             $meta['recording_enabled'] = true;
             $material->metadata = $meta;
             $material->save();

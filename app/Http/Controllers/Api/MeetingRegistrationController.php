@@ -487,19 +487,111 @@ class MeetingRegistrationController extends Controller
 
     private function pathwaysJoinUrl(): ?string
     {
+        $settings = WebinarSetting::current();
+        if (!empty($settings->zoom_join_url)) {
+            return (string) $settings->zoom_join_url;
+        }
+
         $url = trim((string) config('services.pathways_webinar.zoom_join_url', ''));
 
         return $url !== '' ? $url : null;
     }
 
-    private function resolvePathwaysStartUrl(?string $meetingId, ?string $joinUrl): ?string
+    private function syncApprovedRegistrationZoomLinks(?string $joinUrl, ?string $meetingId): void
     {
+        if (!$joinUrl || !Schema::hasColumn('meeting_registrations', 'zoom_join_url')) {
+            return;
+        }
+
+        $update = ['zoom_join_url' => $joinUrl];
+        if ($meetingId && Schema::hasColumn('meeting_registrations', 'zoom_meeting_id')) {
+            $update['zoom_meeting_id'] = $meetingId;
+        }
+
+        MeetingRegistration::query()
+            ->whereRaw("LOWER(COALESCE(status, 'pending')) = 'approved'")
+            ->update($update);
+    }
+
+    /**
+     * @return array{ok: bool, message?: string, settings?: WebinarSetting, meeting?: array}
+     */
+    private function createWebinarZoomSession(WebinarSetting $settings): array
+    {
+        if (!$this->zoom->isConfigured()) {
+            return [
+                'ok' => false,
+                'message' => 'Zoom API credentials are missing. Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET on the server.',
+            ];
+        }
+
+        $topic = 'Pathways Webinar - ' . now()->format('Y-m-d H:i');
+        $meeting = $this->zoom->createInstantMeeting([
+            'topic' => $topic,
+            'duration' => 90,
+            'agenda' => 'Registered participants webinar session',
+            'auto_recording' => (bool) $settings->recording_enabled,
+            'join_before_host' => false,
+            'waiting_room' => true,
+            'mute_upon_entry' => true,
+        ]);
+
+        if ($meeting === null) {
+            return [
+                'ok' => false,
+                'message' => 'Unable to contact Zoom to create the webinar meeting.',
+            ];
+        }
+
+        if (!empty($meeting['error'])) {
+            $zoomMessage = $meeting['body']['message'] ?? 'Zoom rejected meeting creation.';
+
+            return [
+                'ok' => false,
+                'message' => $zoomMessage,
+                'details' => $meeting['body'] ?? null,
+            ];
+        }
+
+        $meetingId = isset($meeting['id']) ? (string) $meeting['id'] : null;
+        $joinUrl = $meeting['join_url'] ?? null;
+        $startUrl = $meeting['start_url'] ?? null;
+
+        if (!$meetingId || !$joinUrl || !$startUrl) {
+            return [
+                'ok' => false,
+                'message' => 'Zoom created a meeting but did not return host/join links.',
+            ];
+        }
+
+        $settings->zoom_meeting_id = $meetingId;
+        $settings->zoom_join_url = $joinUrl;
+        $settings->zoom_start_url = $startUrl;
+        $settings->session_started_at = now();
+        $settings->save();
+
+        $this->syncApprovedRegistrationZoomLinks($joinUrl, $meetingId);
+
+        return [
+            'ok' => true,
+            'settings' => $settings,
+            'meeting' => $meeting,
+        ];
+    }
+
+    private function resolvePathwaysStartUrl(WebinarSetting $settings): ?string
+    {
+        if (!empty($settings->zoom_start_url)) {
+            return (string) $settings->zoom_start_url;
+        }
+
         $configured = trim((string) config('services.pathways_webinar.zoom_start_url', ''));
         if ($configured !== '') {
             return $configured;
         }
 
-        if ($meetingId) {
+        $meetingId = $settings->zoom_meeting_id;
+        if ($meetingId && $this->zoom->canManageMeetingViaApi($meetingId)) {
             $meeting = $this->zoom->getMeeting($meetingId);
             if (is_array($meeting) && empty($meeting['error'])) {
                 $startUrl = $meeting['start_url'] ?? null;
@@ -509,24 +601,24 @@ class MeetingRegistrationController extends Controller
             }
         }
 
-        return $joinUrl;
+        return null;
     }
 
     public function webinarStatus()
     {
         $settings = WebinarSetting::current();
-        $joinUrl = $this->pathwaysJoinUrl();
-        $meetingId = $this->zoom->pathwaysMeetingId();
         $approvedCount = $this->approvedRegistrationCount();
 
         return response()->json([
             'approved_participants' => $approvedCount,
             'can_start' => $approvedCount > 0,
             'recording_enabled' => (bool) $settings->recording_enabled,
-            'join_url' => $joinUrl,
-            'start_url' => $this->resolvePathwaysStartUrl($meetingId, $joinUrl),
-            'zoom_meeting_id' => $meetingId,
+            'join_url' => $settings->zoom_join_url,
+            'start_url' => $this->resolvePathwaysStartUrl($settings),
+            'zoom_meeting_id' => $settings->zoom_meeting_id,
             'session_started_at' => $settings->session_started_at?->toIso8601String(),
+            'zoom_api_configured' => $this->zoom->isConfigured(),
+            'session_active' => !empty($settings->zoom_meeting_id) && !empty($settings->zoom_start_url),
         ]);
     }
 
@@ -542,40 +634,47 @@ class MeetingRegistrationController extends Controller
         }
 
         $settings = WebinarSetting::current();
-        $joinUrl = $this->pathwaysJoinUrl();
-        if (!$joinUrl) {
-            return response()->json([
-                'message' => 'Pathways Zoom join URL is not configured on the server.',
-            ], 500);
-        }
 
-        $meetingId = $this->zoom->pathwaysMeetingId();
-        if ($settings->recording_enabled && $meetingId) {
-            $result = $this->zoom->setMeetingAutoRecording($meetingId, true);
-            if ($result === null) {
+        if (!empty($settings->zoom_start_url) && !empty($settings->zoom_meeting_id)) {
+            $stillLive = $this->zoom->isMeetingLive((string) $settings->zoom_meeting_id);
+            if ($stillLive) {
+                $settings->session_started_at = now();
+                $settings->save();
+
                 return response()->json([
-                    'message' => 'Unable to contact Zoom to enable cloud recording. Check Zoom API credentials.',
-                ], 503);
-            }
-            if (!empty($result['error'])) {
-                Log::warning('Zoom auto-recording enable failed for pathways webinar', [
-                    'meeting_id' => $meetingId,
-                    'result' => $result,
+                    'message' => 'Webinar session is already live. Opening host link.',
+                    'approved_participants' => $approvedCount,
+                    'start_url' => $settings->zoom_start_url,
+                    'join_url' => $settings->zoom_join_url,
+                    'recording_enabled' => (bool) $settings->recording_enabled,
+                    'zoom_meeting_id' => $settings->zoom_meeting_id,
                 ]);
             }
+
+            $settings->zoom_meeting_id = null;
+            $settings->zoom_join_url = null;
+            $settings->zoom_start_url = null;
+            $settings->save();
         }
 
-        $settings->session_started_at = now();
-        $settings->save();
+        $created = $this->createWebinarZoomSession($settings);
+        if (!$created['ok']) {
+            return response()->json([
+                'message' => $created['message'] ?? 'Failed to create Zoom webinar meeting.',
+                'details' => $created['details'] ?? null,
+            ], 502);
+        }
 
-        $startUrl = $this->resolvePathwaysStartUrl($meetingId, $joinUrl);
+        /** @var WebinarSetting $settings */
+        $settings = $created['settings'];
 
         return response()->json([
-            'message' => 'Webinar ready to start',
+            'message' => 'Webinar created on Zoom. Host session opened — participants can use the updated join link.',
             'approved_participants' => $approvedCount,
-            'start_url' => $startUrl,
-            'join_url' => $joinUrl,
+            'start_url' => $settings->zoom_start_url,
+            'join_url' => $settings->zoom_join_url,
             'recording_enabled' => (bool) $settings->recording_enabled,
+            'zoom_meeting_id' => $settings->zoom_meeting_id,
         ]);
     }
 
@@ -586,39 +685,51 @@ class MeetingRegistrationController extends Controller
         ]);
 
         $enabled = (bool) $data['enabled'];
-        $meetingId = $this->zoom->pathwaysMeetingId();
-
-        if ($meetingId) {
-            $result = $this->zoom->setMeetingAutoRecording($meetingId, $enabled);
-            if ($result === null) {
-                return response()->json([
-                    'message' => 'Unable to contact Zoom. Check Zoom API credentials in server settings.',
-                ], 503);
-            }
-            if (!empty($result['error'])) {
-                return response()->json([
-                    'message' => 'Zoom rejected the recording setting change.',
-                    'details' => $result['body'] ?? null,
-                ], 502);
-            }
-        }
-
         $settings = WebinarSetting::current();
         $settings->recording_enabled = $enabled;
         $settings->save();
 
+        $activeMeetingId = $settings->zoom_meeting_id;
+        if ($activeMeetingId && $this->zoom->canManageMeetingViaApi($activeMeetingId)) {
+            $result = $this->zoom->setMeetingAutoRecording($activeMeetingId, $enabled);
+            if ($result === null) {
+                return response()->json([
+                    'message' => 'Recording preference saved, but Zoom could not be contacted to update the live meeting.',
+                    'recording_enabled' => $enabled,
+                ], 503);
+            }
+            if (!empty($result['error'])) {
+                $zoomMessage = $result['body']['message'] ?? 'Zoom rejected the recording setting change.';
+
+                return response()->json([
+                    'message' => $zoomMessage,
+                    'details' => $result['body'] ?? null,
+                    'recording_enabled' => $enabled,
+                ], 502);
+            }
+
+            return response()->json([
+                'message' => $enabled ? 'Cloud recording enabled on the active Zoom meeting.' : 'Cloud recording disabled on the active Zoom meeting.',
+                'recording_enabled' => $enabled,
+                'zoom_meeting_id' => $activeMeetingId,
+            ]);
+        }
+
         return response()->json([
-            'message' => $enabled ? 'Cloud recording enabled for this webinar room.' : 'Cloud recording disabled.',
+            'message' => $enabled
+                ? 'Cloud recording enabled. It will apply automatically when you click Start Meeting.'
+                : 'Cloud recording disabled for the next webinar session.',
             'recording_enabled' => $enabled,
-            'zoom_meeting_id' => $meetingId,
+            'zoom_meeting_id' => null,
         ]);
     }
 
     public function webinarRecordings()
     {
-        $meetingId = $this->zoom->pathwaysMeetingId();
-        $data = $this->zoom->listRecordings('me');
+        $settings = WebinarSetting::current();
+        $meetingId = $settings->zoom_meeting_id;
 
+        $data = $this->zoom->listRecordings($this->zoom->hostUserId());
         if ($data === null) {
             return response()->json(['message' => 'Unable to contact Zoom for recordings'], 503);
         }
@@ -723,10 +834,8 @@ class MeetingRegistrationController extends Controller
             ];
 
             // Auto-approve on registration (trainer provides available schedule).
-            $effectiveJoinUrl = (string) config('services.pathways_webinar.zoom_join_url');
-            if (!$effectiveJoinUrl) {
-                $effectiveJoinUrl = null;
-            }
+            // Join link is issued when the host starts the webinar via Zoom API.
+            $effectiveJoinUrl = null;
 
             $schedule = null;
             if (!empty($data['available_schedule_id'])) {
@@ -808,11 +917,8 @@ class MeetingRegistrationController extends Controller
 
     public function approve(MeetingRegistration $meetingRegistration)
     {
-        // Always use the fixed Zoom join URL for Pathways Webinar.
-        $effectiveJoinUrl = (string) config('services.pathways_webinar.zoom_join_url');
-        if (!$effectiveJoinUrl) {
-            $effectiveJoinUrl = null;
-        }
+        $settings = WebinarSetting::current();
+        $effectiveJoinUrl = $settings->zoom_join_url ?: null;
 
         $schedule = null;
         if (Schema::hasColumn('meeting_registrations', 'available_schedule_id') && !empty($meetingRegistration->available_schedule_id)) {
@@ -829,7 +935,7 @@ class MeetingRegistrationController extends Controller
 
             // Store Zoom join URL + the next session time.
             if (Schema::hasColumn('meeting_registrations', 'zoom_meeting_id')) {
-                $meetingRegistration->zoom_meeting_id = null;
+                $meetingRegistration->zoom_meeting_id = $settings->zoom_meeting_id;
             }
             if (Schema::hasColumn('meeting_registrations', 'zoom_join_url')) {
                 $meetingRegistration->zoom_join_url = $effectiveJoinUrl;

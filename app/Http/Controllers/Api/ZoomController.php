@@ -7,7 +7,6 @@ use App\Services\MailDeliveryService;
 use App\Services\ZoomService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
-use Carbon\Carbon;
 
 class ZoomController extends Controller
 {
@@ -23,39 +22,22 @@ class ZoomController extends Controller
 
     public function listMeetings()
     {
-        // Use the Zoom user associated with the current access token
-        $data = $this->zoom->listMeetings('me');
-        $fallbackJoinUrl = (string) config('services.pathways_webinar.zoom_join_url');
-        $tz = (string) config('services.pathways_webinar.timezone', 'Africa/Kigali');
-        $nextStart = Carbon::now($tz)->addWeek();
+        $data = $this->zoom->listMeetings($this->zoom->hostUserId());
 
-        $fallbackMeeting = [
-            'id' => 'pathways-webinar',
-            'topic' => 'Pathways Webinar',
-            'start_time' => $nextStart->toIso8601String(),
-            'duration' => 60,
-            'join_url' => $fallbackJoinUrl ?: null,
-            'agenda' => 'Weekly Pathways Webinar session',
-        ];
-
-        // If Zoom credentials are missing / Zoom cannot be reached, still return a useful item for the dashboard.
         if ($data === null) {
             return response()->json([
-                'meetings' => $fallbackJoinUrl ? [$fallbackMeeting] : [],
+                'meetings' => [],
                 'fallback_only' => true,
+                'message' => 'Zoom API is not configured or unreachable.',
             ], 200);
         }
 
-        // If Zoom returns no meetings, prepend the fixed Pathways webinar link so the UI isn't empty.
         $meetings = [];
         if (is_array($data) && isset($data['meetings']) && is_array($data['meetings'])) {
             $meetings = $data['meetings'];
         }
-        if (empty($meetings) && $fallbackJoinUrl) {
-            $meetings = [$fallbackMeeting];
-        }
 
-        return response()->json(array_merge($data, ['meetings' => $meetings]), 200);
+        return response()->json(array_merge(is_array($data) ? $data : [], ['meetings' => $meetings]), 200);
     }
 
     public function listRecordings()
@@ -209,7 +191,13 @@ class ZoomController extends Controller
 
         if ($id === 'pathways-webinar') {
             return response()->json([
-                'message' => 'Use Webinar Signups to manage recording for the Pathways webinar room.',
+                'message' => 'Use Webinar Signups to manage recording for registered meetings.',
+            ], 422);
+        }
+
+        if ($this->zoom->isLegacyPathwaysPmiId($id)) {
+            return response()->json([
+                'message' => 'This personal meeting room cannot be managed via the Zoom API. Use Webinar Signups → Start Meeting to create an API session.',
             ], 422);
         }
 

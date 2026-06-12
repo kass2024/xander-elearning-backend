@@ -273,15 +273,30 @@ return new class extends Migration
 
     private function syncWebinarSettingsTable(): void
     {
-        if (Schema::hasTable('webinar_settings')) {
+        if (!Schema::hasTable('webinar_settings')) {
+            Schema::create('webinar_settings', function (Blueprint $table) {
+                $table->id();
+                $table->boolean('recording_enabled')->default(false);
+                $table->string('zoom_meeting_id')->nullable();
+                $table->text('zoom_join_url')->nullable();
+                $table->text('zoom_start_url')->nullable();
+                $table->timestamp('session_started_at')->nullable();
+                $table->timestamps();
+            });
+
             return;
         }
 
-        Schema::create('webinar_settings', function (Blueprint $table) {
-            $table->id();
-            $table->boolean('recording_enabled')->default(false);
-            $table->timestamp('session_started_at')->nullable();
-            $table->timestamps();
+        Schema::table('webinar_settings', function (Blueprint $table) {
+            if (!Schema::hasColumn('webinar_settings', 'zoom_meeting_id')) {
+                $table->string('zoom_meeting_id')->nullable()->after('recording_enabled');
+            }
+            if (!Schema::hasColumn('webinar_settings', 'zoom_join_url')) {
+                $table->text('zoom_join_url')->nullable()->after('zoom_meeting_id');
+            }
+            if (!Schema::hasColumn('webinar_settings', 'zoom_start_url')) {
+                $table->text('zoom_start_url')->nullable()->after('zoom_join_url');
+            }
         });
     }
 

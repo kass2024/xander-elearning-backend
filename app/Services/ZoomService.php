@@ -87,6 +87,86 @@ class ZoomService
         return $response->json();
     }
 
+    public function hostUserId(): string
+    {
+        return (string) config('services.zoom.host_user_id', 'me');
+    }
+
+    public function isConfigured(): bool
+    {
+        return $this->accountId !== '' && $this->clientId !== '' && $this->clientSecret !== '';
+    }
+
+    /**
+     * Legacy personal-meeting links cannot be updated via the Meetings API.
+     */
+    public function isLegacyPathwaysPmiId(?string $meetingId): bool
+    {
+        if (!$meetingId) {
+            return false;
+        }
+
+        $legacy = $this->pathwaysMeetingId();
+        if (!$legacy) {
+            return false;
+        }
+
+        return (string) $meetingId === (string) $legacy;
+    }
+
+    public function canManageMeetingViaApi(?string $meetingId): bool
+    {
+        $meetingId = trim((string) $meetingId);
+        if ($meetingId === '' || $this->isLegacyPathwaysPmiId($meetingId)) {
+            return false;
+        }
+
+        $meeting = $this->getMeeting($meetingId);
+
+        return is_array($meeting) && empty($meeting['error']);
+    }
+
+    /**
+     * Create a Zoom instant meeting (type 1) for live webinar start.
+     */
+    public function createInstantMeeting(array $data, ?string $userId = null): ?array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return null;
+        }
+
+        $host = $userId ?: $this->hostUserId();
+
+        $payload = [
+            'topic' => $data['topic'] ?? 'Live session',
+            'type' => 1,
+            'duration' => (int) ($data['duration'] ?? 60),
+            'agenda' => $data['agenda'] ?? '',
+            'settings' => [
+                'join_before_host' => (bool) ($data['join_before_host'] ?? false),
+                'waiting_room' => (bool) ($data['waiting_room'] ?? true),
+                'mute_upon_entry' => $data['mute_upon_entry'] ?? true,
+                'auto_recording' => ($data['auto_recording'] ?? false) ? 'cloud' : 'none',
+                'host_video' => $data['host_video'] ?? true,
+                'participant_video' => $data['participant_video'] ?? false,
+                'audio' => $data['audio'] ?? 'both',
+            ],
+        ];
+
+        $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
+
+        if ($response->failed()) {
+            return [
+                'error' => true,
+                'status' => $response->status(),
+                'body' => $response->json(),
+            ];
+        }
+
+        return $response->json();
+    }
+
     public function createMeeting(array $data, string $userId = 'me'): ?array
     {
         $client = $this->client();
@@ -278,6 +358,16 @@ class ZoomService
 
     public function setMeetingAutoRecording(string $meetingId, bool $enabled): ?array
     {
+        if ($this->isLegacyPathwaysPmiId($meetingId)) {
+            return [
+                'error' => true,
+                'status' => 400,
+                'body' => [
+                    'message' => 'Legacy personal meeting rooms cannot be updated via the Zoom API. Create a meeting through the API first.',
+                ],
+            ];
+        }
+
         $client = $this->client();
         if (!$client) {
             return null;

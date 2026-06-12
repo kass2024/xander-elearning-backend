@@ -15,6 +15,9 @@ return new class extends Migration
         Schema::create('webinar_settings', function (Blueprint $table) {
             $table->id();
             $table->boolean('recording_enabled')->default(false);
+            $table->string('zoom_meeting_id')->nullable();
+            $table->text('zoom_join_url')->nullable();
+            $table->text('zoom_start_url')->nullable();
             $table->timestamp('session_started_at')->nullable();
             $table->timestamps();
         });
