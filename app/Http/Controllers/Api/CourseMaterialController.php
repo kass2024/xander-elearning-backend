@@ -16,10 +16,14 @@ class CourseMaterialController extends Controller
 {
     public function index(Course $course)
     {
-        return response()->json(
-            $course->materials()->orderBy('sort_order')->orderByDesc('id')->get(),
-            200
-        );
+        return response()->json([
+            'course' => [
+                'id' => $course->id,
+                'title' => $course->title,
+                'description' => $course->description,
+            ],
+            'materials' => $this->buildCourseMaterialsPayload($course),
+        ], 200);
     }
 
     public function learnerIndex(Request $request, Course $course)
@@ -41,6 +45,21 @@ class CourseMaterialController extends Controller
             ], 403);
         }
 
+        return response()->json([
+            'course' => [
+                'id' => $course->id,
+                'title' => $course->title,
+                'description' => $course->description,
+            ],
+            'materials' => $this->buildCourseMaterialsPayload($course),
+        ], 200);
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildCourseMaterialsPayload(Course $course): array
+    {
         $materials = $course->materials()
             ->orderBy('sort_order')
             ->orderByDesc('id')
@@ -62,7 +81,7 @@ class CourseMaterialController extends Controller
             $courseMeetingIds
         );
 
-        $payload = $materials
+        return $materials
             ->map(function (CourseMaterial $m) use ($liveMeetingIds, $recordingsByMeetingId) {
                 $arr = CourseMaterialHelper::toLearnerArray($m, $liveMeetingIds);
 
@@ -75,16 +94,8 @@ class CourseMaterialController extends Controller
 
                 return $arr;
             })
-            ->values();
-
-        return response()->json([
-            'course' => [
-                'id' => $course->id,
-                'title' => $course->title,
-                'description' => $course->description,
-            ],
-            'materials' => $payload,
-        ], 200);
+            ->values()
+            ->all();
     }
 
     public function store(Request $request, Course $course)

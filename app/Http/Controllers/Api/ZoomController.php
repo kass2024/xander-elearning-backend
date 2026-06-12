@@ -244,6 +244,39 @@ class ZoomController extends Controller
         return response()->json(['message' => 'Meeting deleted on Zoom']);
     }
 
+    public function deleteRecording(Request $request, string $meetingId)
+    {
+        if (!$this->zoom->isConfigured()) {
+            return response()->json(['message' => 'Zoom API is not configured'], 503);
+        }
+
+        $data = $request->validate([
+            'recording_id' => 'nullable|string|max:255',
+            'uuid' => 'nullable|string|max:500',
+        ]);
+
+        $targetId = !empty($data['uuid']) ? (string) $data['uuid'] : $meetingId;
+        $result = $this->zoom->deleteCloudRecording($targetId, $data['recording_id'] ?? null);
+
+        if (empty($result['ok'])) {
+            Log::warning('Zoom cloud recording delete failed', [
+                'meeting_id' => $meetingId,
+                'target_id' => $targetId,
+                'recording_id' => $data['recording_id'] ?? null,
+                'result' => $result,
+            ]);
+
+            return response()->json([
+                'message' => $result['message'] ?? 'Unable to delete recording from Zoom cloud',
+                'details' => $result['body'] ?? null,
+            ], $result['status'] ?? 502);
+        }
+
+        return response()->json([
+            'message' => $result['message'] ?? 'Recording deleted from Zoom cloud',
+        ]);
+    }
+
     public function setMeetingRecording(Request $request, string $id)
     {
         $data = $request->validate([

@@ -85,14 +85,47 @@ class AdminRecordingCatalog
     }
 
     /**
+     * @return array<string, array{course_id?: int, course_title?: string, instructor_id?: int, instructor_name?: string, instructor_email?: string}>
+     */
+    public static function contextByMeetingId(): array
+    {
+        $map = [];
+
+        CourseMaterial::query()
+            ->where('type', 'zoom')
+            ->with(['course.instructors'])
+            ->get()
+            ->each(function (CourseMaterial $material) use (&$map) {
+                $meetingId = CourseMaterialHelper::meetingId($material);
+                if (!$meetingId || LearnerRecordingAccess::isPathwaysWebinarMeeting($meetingId)) {
+                    return;
+                }
+
+                $instructors = $material->course?->instructors ?? collect();
+                $primary = $instructors->first();
+
+                $map[(string) $meetingId] = [
+                    'course_id' => $material->course_id,
+                    'course_title' => $material->course?->title,
+                    'instructor_id' => $primary?->id,
+                    'instructor_name' => $primary?->name,
+                    'instructor_email' => $primary?->email,
+                ];
+            });
+
+        return $map;
+    }
+
+    /**
      * @param  list<array<string, mixed>>  $items
      * @return list<array<string, mixed>>
      */
     public static function annotateItems(array $items): array
     {
         $sourceMap = self::sourceByMeetingId();
+        $contextMap = self::contextByMeetingId();
 
-        return array_map(function (array $item) use ($sourceMap) {
+        return array_map(function (array $item) use ($sourceMap, $contextMap) {
             $meetingId = (string) ($item['id'] ?? '');
             $source = $sourceMap[$meetingId] ?? 'other';
             $topic = strtolower((string) ($item['topic'] ?? ''));
@@ -107,6 +140,15 @@ class AdminRecordingCatalog
 
             $item['source'] = $source;
             $item['source_label'] = self::sourceLabel($source);
+
+            $context = $contextMap[$meetingId] ?? [];
+            if ($context !== []) {
+                $item = array_merge($item, $context);
+            }
+
+            if ($source === 'webinar' && empty($item['course_title'])) {
+                $item['course_title'] = 'Pathways Webinar';
+            }
 
             return $item;
         }, $items);

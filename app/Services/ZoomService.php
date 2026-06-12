@@ -696,6 +696,44 @@ class ZoomService
     }
 
     /**
+     * Permanently delete cloud recording(s) for a Zoom meeting.
+     *
+     * @return array{ok: bool, message?: string, status?: int, body?: mixed}
+     */
+    public function deleteCloudRecording(string $meetingId, ?string $recordingId = null): array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return ['ok' => false, 'message' => 'Zoom API is not configured'];
+        }
+
+        $encoded = $this->encodeMeetingIdForPath($meetingId);
+        if ($encoded === '') {
+            return ['ok' => false, 'message' => 'Invalid meeting id'];
+        }
+
+        $path = $recordingId
+            ? "/meetings/{$encoded}/recordings/{$recordingId}"
+            : "/meetings/{$encoded}/recordings";
+
+        $response = $client->delete($path, ['action' => 'delete']);
+
+        if ($response->successful() || $response->status() === 204) {
+            return ['ok' => true, 'message' => 'Recording deleted from Zoom cloud'];
+        }
+
+        $body = $response->json();
+        $message = is_array($body) ? ($body['message'] ?? 'Zoom rejected the delete request') : 'Zoom rejected the delete request';
+
+        return [
+            'ok' => false,
+            'message' => $message,
+            'status' => $response->status(),
+            'body' => $body,
+        ];
+    }
+
+    /**
      * Zoom meeting IDs currently in progress for the account host user.
      *
      * @return array<int, string>
