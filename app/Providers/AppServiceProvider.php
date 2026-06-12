@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Services\DatabaseSchemaService;
 use App\Services\MailDeliveryService;
+use App\Services\StripePaymentService;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 
@@ -13,6 +14,7 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->singleton(DatabaseSchemaService::class);
         $this->app->singleton(MailDeliveryService::class);
+        $this->app->singleton(StripePaymentService::class);
     }
 
     public function boot(): void

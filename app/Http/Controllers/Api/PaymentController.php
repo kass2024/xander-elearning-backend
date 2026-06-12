@@ -3,17 +3,19 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Course;
+use App\Models\CoursePayment;
+use App\Services\StripePaymentService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
-use Stripe\Checkout\Session as StripeCheckoutSession;
-use Stripe\PaymentIntent;
-use Stripe\Stripe;
-use App\Models\Course;
-use App\Models\CourseEnrollment;
-use App\Models\CoursePayment;
 
 class PaymentController extends Controller
 {
+    public function __construct(
+        private readonly StripePaymentService $stripePayments
+    ) {
+    }
+
     public function index()
     {
         $payments = CoursePayment::query()
@@ -65,13 +67,13 @@ class PaymentController extends Controller
 
     public function stripeConfig()
     {
-        $secret = config('services.stripe.secret');
-        $public = config('services.stripe.key');
+        $configured = $this->stripePayments->isConfigured() && $this->stripePayments->isSdkInstalled();
 
         return response()->json([
-            'configured' => !empty($secret) && !empty($public),
-            'publishable_key' => $public ?: null,
+            'configured' => $configured,
+            'publishable_key' => config('services.stripe.key') ?: null,
             'provider' => 'Stripe',
+            'sdk_installed' => $this->stripePayments->isSdkInstalled(),
         ], 200);
     }
 
@@ -82,84 +84,24 @@ class PaymentController extends Controller
             'student_id' => 'required|integer',
         ]);
 
-        if (empty(config('services.stripe.secret'))) {
-            return response()->json([
-                'message' => 'Stripe is not configured. Set STRIPE_SECRET_KEY and STRIPE_PUBLIC_KEY in backend .env.',
-            ], 503);
-        }
-
         $course = Course::findOrFail($validated['course_id']);
 
-        $enrollment = CourseEnrollment::where('student_id', $validated['student_id'])
-            ->where('course_id', $course->id)
-            ->first();
-
-        if (!$enrollment) {
-            return response()->json([
-                'message' => 'You must apply for this course before paying.',
-            ], 422);
-        }
-
-        if ($enrollment->status !== 'approved') {
-            return response()->json([
-                'message' => 'Your enrollment is pending administrator approval. An admin must approve your application in Student Management before you can pay.',
-            ], 422);
-        }
-
-        $amount = (int) (($course->price ?? 0) * 100);
-        if ($amount <= 0) {
-            return response()->json([
-                'message' => 'Course price is not set for payments.',
-            ], 422);
-        }
-
-        $frontend = rtrim((string) config('app.frontend_url', config('app.url')), '/');
-
         try {
-            Stripe::setApiKey(config('services.stripe.secret'));
-
-            $session = StripeCheckoutSession::create([
-                'mode' => 'payment',
-                'payment_method_types' => ['card'],
-                'line_items' => [[
-                    'price_data' => [
-                        'currency' => 'usd',
-                        'product_data' => [
-                            'name' => (string) $course->title,
-                        ],
-                        'unit_amount' => $amount,
-                    ],
-                    'quantity' => 1,
-                ]],
-                'metadata' => [
-                    'course_id' => (string) $course->id,
-                    'student_id' => (string) $validated['student_id'],
-                ],
-                'success_url' => $frontend . '/payment/success?session_id={CHECKOUT_SESSION_ID}',
-                'cancel_url' => $frontend . '/payment/cancel',
-            ]);
-
-            CoursePayment::updateOrCreate(
-                [
-                    'course_id' => $course->id,
-                    'student_id' => $validated['student_id'],
-                    'stripe_session_id' => $session->id,
-                ],
-                [
-                    'amount_cents' => $amount,
-                    'currency' => 'usd',
-                    'provider' => 'stripe',
-                    'status' => 'pending',
-                    'metadata' => [
-                        'checkout_url' => $session->url,
-                    ],
-                ]
+            $result = $this->stripePayments->createCheckoutSession(
+                $course,
+                (int) $validated['student_id']
             );
 
+            if (empty($result['ok'])) {
+                return response()->json([
+                    'message' => $result['message'] ?? 'Unable to initiate payment.',
+                ], $result['status'] ?? 500);
+            }
+
             return response()->json([
-                'url' => $session->url,
+                'url' => $result['url'],
             ]);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Stripe checkout error', [
                 'error' => $e->getMessage(),
             ]);
@@ -176,43 +118,19 @@ class PaymentController extends Controller
             'session_id' => 'required|string',
         ]);
 
-        if (empty(config('services.stripe.secret'))) {
-            return response()->json(['message' => 'Stripe is not configured.'], 503);
-        }
-
         try {
-            Stripe::setApiKey(config('services.stripe.secret'));
-            $session = StripeCheckoutSession::retrieve($validated['session_id']);
+            $result = $this->stripePayments->confirmCheckoutSession($validated['session_id']);
 
-            if ($session->payment_status !== 'paid') {
-                return response()->json(['message' => 'Payment was not completed.'], 422);
+            if (empty($result['ok'])) {
+                return response()->json([
+                    'message' => $result['message'] ?? 'Unable to confirm payment.',
+                ], $result['status'] ?? 500);
             }
-
-            $courseId = (int) ($session->metadata['course_id'] ?? 0);
-            $studentId = (int) ($session->metadata['student_id'] ?? 0);
-
-            if ($courseId && $studentId) {
-                $enrollment = CourseEnrollment::where('student_id', $studentId)
-                    ->where('course_id', $courseId)
-                    ->first();
-
-                if ($enrollment && in_array($enrollment->status, ['approved', 'paid'], true)) {
-                    $enrollment->status = 'paid';
-                    $enrollment->save();
-                }
-            }
-
-            CoursePayment::query()
-                ->where('stripe_session_id', $session->id)
-                ->update([
-                    'status' => 'paid',
-                    'paid_at' => now(),
-                ]);
 
             return response()->json([
-                'message' => 'Payment confirmed. Your course access is now active.',
+                'message' => $result['message'],
             ]);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Stripe confirm checkout error', ['error' => $e->getMessage()]);
 
             return response()->json(['message' => 'Unable to confirm payment.'], 500);
@@ -226,51 +144,24 @@ class PaymentController extends Controller
             'student_id' => 'required|integer',
         ]);
 
-        if (empty(config('services.stripe.secret'))) {
-            return response()->json([
-                'message' => 'Stripe is not configured. Set STRIPE_SECRET_KEY and STRIPE_PUBLIC_KEY in backend .env.',
-            ], 503);
-        }
-
         $course = Course::findOrFail($validated['course_id']);
 
-        $amount = (int) (($course->price ?? 0) * 100);
-        if ($amount <= 0) {
-            return response()->json([
-                'message' => 'Course price is not set for payments.',
-            ], 422);
-        }
-
         try {
-            Stripe::setApiKey(config('services.stripe.secret'));
-
-            $intent = PaymentIntent::create([
-                'amount' => $amount,
-                'currency' => 'usd',
-                'metadata' => [
-                    'course_id' => (string) $course->id,
-                    'student_id' => (string) $validated['student_id'],
-                ],
-            ]);
-
-            CoursePayment::updateOrCreate(
-                [
-                    'course_id' => $course->id,
-                    'student_id' => $validated['student_id'],
-                    'stripe_payment_intent_id' => $intent->id,
-                ],
-                [
-                    'amount_cents' => $amount,
-                    'currency' => 'usd',
-                    'provider' => 'stripe',
-                    'status' => 'pending',
-                ]
+            $result = $this->stripePayments->createPaymentIntent(
+                $course,
+                (int) $validated['student_id']
             );
 
+            if (empty($result['ok'])) {
+                return response()->json([
+                    'message' => $result['message'] ?? 'Unable to start payment.',
+                ], $result['status'] ?? 500);
+            }
+
             return response()->json([
-                'client_secret' => $intent->client_secret,
+                'client_secret' => $result['client_secret'],
             ]);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Stripe payment intent error', [
                 'error' => $e->getMessage(),
             ]);
