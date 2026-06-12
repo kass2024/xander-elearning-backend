@@ -176,13 +176,19 @@ class ZoomService
 
         $startTime = null;
         if (!empty($data['start_time'])) {
-            try {
-                $dt = new \DateTime($data['start_time']);
-                $startTime = $dt->format('Y-m-d\TH:i:s\Z');
-            } catch (\Throwable $e) {
-                $startTime = $data['start_time'];
+            if ($data['start_time'] instanceof \DateTimeInterface) {
+                $startTime = $data['start_time']->format('Y-m-d\TH:i:s');
+            } else {
+                try {
+                    $dt = new \DateTime((string) $data['start_time']);
+                    $startTime = $dt->format('Y-m-d\TH:i:s');
+                } catch (\Throwable $e) {
+                    $startTime = (string) $data['start_time'];
+                }
             }
         }
+
+        $host = $userId ?: $this->hostUserId();
 
         $payload = [
             'topic'      => $data['topic'] ?? 'Meeting',
@@ -207,7 +213,7 @@ class ZoomService
             ],
         ];
 
-        $response = $client->post("/users/{$userId}/meetings", $payload);
+        $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
 
         if ($response->failed()) {
             return [

@@ -306,7 +306,7 @@ class MeetingRegistrationController extends Controller
         if (!empty($meetingRegistration->zoom_join_url)) {
             $effectiveJoinUrl = $meetingRegistration->zoom_join_url;
         }
-        if (!$effectiveJoinUrl) {
+        if (!$effectiveJoinUrl && !$this->zoom->isConfigured()) {
             $effectiveJoinUrl = (string) config('services.pathways_webinar.zoom_join_url');
         }
 
@@ -377,7 +377,7 @@ class MeetingRegistrationController extends Controller
                 if (!$effectiveJoinUrl && !empty($meetingRegistration->zoom_join_url)) {
                     $effectiveJoinUrl = $meetingRegistration->zoom_join_url;
                 }
-                if (!$effectiveJoinUrl) {
+                if (!$effectiveJoinUrl && !$this->zoom->isConfigured()) {
                     $effectiveJoinUrl = (string) config('services.pathways_webinar.zoom_join_url');
                 }
 
@@ -513,6 +513,145 @@ class MeetingRegistrationController extends Controller
             ->update($update);
     }
 
+    private function scheduleDurationMinutes(?AvailableSchedule $schedule): int
+    {
+        if (!$schedule) {
+            return 60;
+        }
+
+        $tz = $this->scheduleTimezone($schedule);
+        $rawStart = (string) ($schedule->start_time ?? '');
+        $rawEnd = (string) ($schedule->end_time ?? '');
+
+        try {
+            $parse = function (string $raw) use ($tz): ?Carbon {
+                if ($raw === '') {
+                    return null;
+                }
+                $core = substr($raw, 0, 5);
+                [$h, $m] = array_pad(explode(':', $core), 2, '0');
+
+                return Carbon::createFromTime((int) $h, (int) $m, 0, $tz);
+            };
+
+            $start = $parse($rawStart);
+            $end = $parse($rawEnd);
+            if (!$start || !$end) {
+                return 60;
+            }
+
+            $minutes = (int) $start->diffInMinutes($end, false);
+
+            return max(15, min(180, $minutes > 0 ? $minutes : 60));
+        } catch (\Throwable $e) {
+            return 60;
+        }
+    }
+
+    private function scheduleTimezone(?AvailableSchedule $schedule): string
+    {
+        return (string) ($schedule?->timezone ?: config('services.pathways_webinar.timezone', 'Africa/Kigali'));
+    }
+
+    private function scheduledSessionKey(Carbon $startAt): string
+    {
+        return $startAt->copy()->utc()->format('Y-m-d H:i');
+    }
+
+    /**
+     * Create or reuse a scheduled Zoom meeting for the upcoming webinar session.
+     *
+     * @return array{ok: bool, message?: string, join_url?: string|null, start_url?: string|null, meeting_id?: string|null, reused?: bool, details?: mixed}
+     */
+    private function ensureScheduledWebinarMeeting(
+        WebinarSetting $settings,
+        Carbon $startAt,
+        ?AvailableSchedule $schedule
+    ): array {
+        if (!$this->zoom->isConfigured()) {
+            return [
+                'ok' => false,
+                'message' => 'Zoom API credentials are missing. Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET.',
+            ];
+        }
+
+        $sessionKey = $this->scheduledSessionKey($startAt);
+
+        if (
+            $settings->zoom_meeting_id &&
+            $settings->zoom_join_url &&
+            $settings->zoom_scheduled_at &&
+            $this->scheduledSessionKey(Carbon::parse($settings->zoom_scheduled_at)) === $sessionKey &&
+            $this->zoom->canManageMeetingViaApi((string) $settings->zoom_meeting_id)
+        ) {
+            return [
+                'ok' => true,
+                'join_url' => $settings->zoom_join_url,
+                'start_url' => $settings->zoom_start_url,
+                'meeting_id' => (string) $settings->zoom_meeting_id,
+                'reused' => true,
+            ];
+        }
+
+        $tz = $this->scheduleTimezone($schedule);
+        $startLocal = $startAt->copy()->setTimezone($tz);
+        $topic = 'Pathways Webinar - ' . $startLocal->format('M j, Y g:i A');
+
+        $meeting = $this->zoom->createMeeting([
+            'topic' => $topic,
+            'start_time' => $startLocal->format('Y-m-d\TH:i:s'),
+            'timezone' => $tz,
+            'duration' => $this->scheduleDurationMinutes($schedule),
+            'agenda' => 'Registered participants webinar session',
+            'auto_recording' => (bool) $settings->recording_enabled,
+            'join_before_host' => true,
+            'waiting_room' => true,
+            'mute_upon_entry' => true,
+        ], $this->zoom->hostUserId());
+
+        if ($meeting === null) {
+            return [
+                'ok' => false,
+                'message' => 'Unable to contact Zoom to create the scheduled webinar meeting.',
+            ];
+        }
+
+        if (!empty($meeting['error'])) {
+            return [
+                'ok' => false,
+                'message' => $meeting['body']['message'] ?? 'Zoom rejected meeting creation.',
+                'details' => $meeting['body'] ?? null,
+            ];
+        }
+
+        $meetingId = isset($meeting['id']) ? (string) $meeting['id'] : null;
+        $joinUrl = $meeting['join_url'] ?? null;
+        $startUrl = $meeting['start_url'] ?? null;
+
+        if (!$meetingId || !$joinUrl) {
+            return [
+                'ok' => false,
+                'message' => 'Zoom created a meeting but did not return join links.',
+            ];
+        }
+
+        $settings->zoom_meeting_id = $meetingId;
+        $settings->zoom_join_url = $joinUrl;
+        $settings->zoom_start_url = $startUrl;
+        $settings->zoom_scheduled_at = $startAt;
+        $settings->save();
+
+        $this->syncApprovedRegistrationZoomLinks($joinUrl, $meetingId);
+
+        return [
+            'ok' => true,
+            'join_url' => $joinUrl,
+            'start_url' => $startUrl,
+            'meeting_id' => $meetingId,
+            'reused' => false,
+        ];
+    }
+
     /**
      * @return array{ok: bool, message?: string, settings?: WebinarSetting, meeting?: array}
      */
@@ -567,6 +706,7 @@ class MeetingRegistrationController extends Controller
         $settings->zoom_meeting_id = $meetingId;
         $settings->zoom_join_url = $joinUrl;
         $settings->zoom_start_url = $startUrl;
+        $settings->zoom_scheduled_at = now();
         $settings->session_started_at = now();
         $settings->save();
 
@@ -616,6 +756,7 @@ class MeetingRegistrationController extends Controller
             'join_url' => $settings->zoom_join_url,
             'start_url' => $this->resolvePathwaysStartUrl($settings),
             'zoom_meeting_id' => $settings->zoom_meeting_id,
+            'zoom_scheduled_at' => $settings->zoom_scheduled_at?->toIso8601String(),
             'session_started_at' => $settings->session_started_at?->toIso8601String(),
             'zoom_api_configured' => $this->zoom->isConfigured(),
             'session_active' => !empty($settings->zoom_meeting_id) && !empty($settings->zoom_start_url),
@@ -635,41 +776,49 @@ class MeetingRegistrationController extends Controller
 
         $settings = WebinarSetting::current();
 
-        if (!empty($settings->zoom_start_url) && !empty($settings->zoom_meeting_id)) {
-            $stillLive = $this->zoom->isMeetingLive((string) $settings->zoom_meeting_id);
-            if ($stillLive) {
-                $settings->session_started_at = now();
-                $settings->save();
+        if (empty($settings->zoom_start_url) || empty($settings->zoom_meeting_id)) {
+            $latest = MeetingRegistration::query()
+                ->with('availableSchedule')
+                ->whereRaw("LOWER(COALESCE(status, 'pending')) = 'approved'")
+                ->orderByDesc('id')
+                ->first();
 
-                return response()->json([
-                    'message' => 'Webinar session is already live. Opening host link.',
-                    'approved_participants' => $approvedCount,
-                    'start_url' => $settings->zoom_start_url,
-                    'join_url' => $settings->zoom_join_url,
-                    'recording_enabled' => (bool) $settings->recording_enabled,
-                    'zoom_meeting_id' => $settings->zoom_meeting_id,
-                ]);
+            if ($latest) {
+                $schedule = $latest->availableSchedule;
+                $startAt = !empty($latest->zoom_start_time)
+                    ? Carbon::parse($latest->zoom_start_time)
+                    : ($schedule ? $this->getNextStartFromSchedule($schedule) : $this->getNextWebinarStartTime());
+
+                $ensured = $this->ensureScheduledWebinarMeeting($settings, $startAt, $schedule);
+                if (!$ensured['ok']) {
+                    return response()->json([
+                        'message' => $ensured['message'] ?? 'Could not prepare the Zoom meeting.',
+                        'details' => $ensured['details'] ?? null,
+                    ], 502);
+                }
+                $settings->refresh();
+            } else {
+                $created = $this->createWebinarZoomSession($settings);
+                if (!$created['ok']) {
+                    return response()->json([
+                        'message' => $created['message'] ?? 'Failed to create Zoom webinar meeting.',
+                        'details' => $created['details'] ?? null,
+                    ], 502);
+                }
+                $settings = $created['settings'];
             }
-
-            $settings->zoom_meeting_id = null;
-            $settings->zoom_join_url = null;
-            $settings->zoom_start_url = null;
-            $settings->save();
         }
 
-        $created = $this->createWebinarZoomSession($settings);
-        if (!$created['ok']) {
-            return response()->json([
-                'message' => $created['message'] ?? 'Failed to create Zoom webinar meeting.',
-                'details' => $created['details'] ?? null,
-            ], 502);
+        $meetingId = (string) $settings->zoom_meeting_id;
+        if ($settings->recording_enabled && $meetingId && $this->zoom->canManageMeetingViaApi($meetingId)) {
+            $this->zoom->setMeetingAutoRecording($meetingId, true);
         }
 
-        /** @var WebinarSetting $settings */
-        $settings = $created['settings'];
+        $settings->session_started_at = now();
+        $settings->save();
 
         return response()->json([
-            'message' => 'Webinar created on Zoom. Host session opened — participants can use the updated join link.',
+            'message' => 'Opening host session. Registered participants already have the join link from their confirmation email.',
             'approved_participants' => $approvedCount,
             'start_url' => $settings->zoom_start_url,
             'join_url' => $settings->zoom_join_url,
@@ -833,15 +982,22 @@ class MeetingRegistrationController extends Controller
                 'notes' => $data['notes'] ?? null,
             ];
 
-            // Auto-approve on registration (trainer provides available schedule).
-            // Join link is issued when the host starts the webinar via Zoom API.
+            // Auto-approve on registration — create scheduled Zoom meeting and email join link immediately.
             $effectiveJoinUrl = null;
+            $effectiveMeetingId = null;
 
             $schedule = null;
             if (!empty($data['available_schedule_id'])) {
                 $schedule = AvailableSchedule::query()->find($data['available_schedule_id']);
             }
             $startAt = $schedule ? $this->getNextStartFromSchedule($schedule) : $this->getNextWebinarStartTime();
+
+            $settings = WebinarSetting::current();
+            $zoom = $this->ensureScheduledWebinarMeeting($settings, $startAt, $schedule);
+            if ($zoom['ok']) {
+                $effectiveJoinUrl = $zoom['join_url'] ?? null;
+                $effectiveMeetingId = $zoom['meeting_id'] ?? null;
+            }
 
             if (Schema::hasColumn('meeting_registrations', 'status')) {
                 $createRegistration['status'] = 'Approved';
@@ -850,7 +1006,7 @@ class MeetingRegistrationController extends Controller
                 $createRegistration['rejected_reason'] = null;
             }
             if (Schema::hasColumn('meeting_registrations', 'zoom_meeting_id')) {
-                $createRegistration['zoom_meeting_id'] = null;
+                $createRegistration['zoom_meeting_id'] = $effectiveMeetingId;
             }
             if (Schema::hasColumn('meeting_registrations', 'zoom_join_url')) {
                 $createRegistration['zoom_join_url'] = $effectiveJoinUrl;
@@ -872,11 +1028,14 @@ class MeetingRegistrationController extends Controller
             $this->sendStatusEmail($registration, 'Approved', null, $effectiveJoinUrl, $scheduleLabelFromForm);
 
             return response()->json([
-                'message' => 'Meeting registration saved',
+                'message' => $effectiveJoinUrl
+                    ? 'Meeting registration saved. Zoom join link sent by email.'
+                    : 'Meeting registration saved, but Zoom link could not be created. Check Zoom API credentials.',
                 'role' => $user->role,
                 'user' => $user,
-                'registration' => $registration,
+                'registration' => $registration->fresh(),
                 'zoom_join_url' => $effectiveJoinUrl,
+                'zoom_error' => $zoom['ok'] ? null : ($zoom['message'] ?? null),
             ], 201);
         });
     }
@@ -918,14 +1077,19 @@ class MeetingRegistrationController extends Controller
     public function approve(MeetingRegistration $meetingRegistration)
     {
         $settings = WebinarSetting::current();
-        $effectiveJoinUrl = $settings->zoom_join_url ?: null;
 
         $schedule = null;
         if (Schema::hasColumn('meeting_registrations', 'available_schedule_id') && !empty($meetingRegistration->available_schedule_id)) {
             $schedule = AvailableSchedule::query()->find($meetingRegistration->available_schedule_id);
         }
 
-        $startAt = $schedule ? $this->getNextStartFromSchedule($schedule) : $this->getNextWebinarStartTime();
+        $startAt = !empty($meetingRegistration->zoom_start_time)
+            ? Carbon::parse($meetingRegistration->zoom_start_time)
+            : ($schedule ? $this->getNextStartFromSchedule($schedule) : $this->getNextWebinarStartTime());
+
+        $zoom = $this->ensureScheduledWebinarMeeting($settings, $startAt, $schedule);
+        $effectiveJoinUrl = $zoom['ok'] ? ($zoom['join_url'] ?? null) : ($settings->zoom_join_url ?: null);
+        $effectiveMeetingId = $zoom['ok'] ? ($zoom['meeting_id'] ?? null) : ($settings->zoom_meeting_id ?: null);
 
         if (Schema::hasColumn('meeting_registrations', 'status')) {
             $meetingRegistration->status = 'Approved';
@@ -933,9 +1097,8 @@ class MeetingRegistrationController extends Controller
                 $meetingRegistration->rejected_reason = null;
             }
 
-            // Store Zoom join URL + the next session time.
             if (Schema::hasColumn('meeting_registrations', 'zoom_meeting_id')) {
-                $meetingRegistration->zoom_meeting_id = $settings->zoom_meeting_id;
+                $meetingRegistration->zoom_meeting_id = $effectiveMeetingId;
             }
             if (Schema::hasColumn('meeting_registrations', 'zoom_join_url')) {
                 $meetingRegistration->zoom_join_url = $effectiveJoinUrl;
@@ -951,7 +1114,6 @@ class MeetingRegistrationController extends Controller
             $meetingRegistration->save();
         }
 
-        // Ensure schedule relation is available for email rendering.
         if (Schema::hasColumn('meeting_registrations', 'available_schedule_id')) {
             $meetingRegistration->load('availableSchedule');
         }
@@ -959,9 +1121,12 @@ class MeetingRegistrationController extends Controller
         $this->sendStatusEmail($meetingRegistration, 'Approved', null, $effectiveJoinUrl);
 
         return response()->json([
-            'message' => 'Meeting registration approved',
+            'message' => $effectiveJoinUrl
+                ? 'Meeting registration approved. Zoom join link sent by email.'
+                : 'Meeting registration approved, but Zoom link could not be created.',
             'registration' => $meetingRegistration,
             'zoom_join_url' => $effectiveJoinUrl,
+            'zoom_error' => $zoom['ok'] ? null : ($zoom['message'] ?? null),
         ]);
     }
 
