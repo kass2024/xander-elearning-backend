@@ -9,23 +9,24 @@ class FrontendUrl
      */
     public static function base(): string
     {
-        $configured = rtrim((string) config('app.frontend_url', ''), '/');
-        if ($configured !== '') {
-            return $configured;
+        $explicit = rtrim((string) env('FRONTEND_URL', ''), '/');
+        if ($explicit !== '') {
+            return $explicit;
         }
 
         $appUrl = rtrim((string) config('app.url', ''), '/');
-        if ($appUrl === '') {
-            return 'http://localhost:8080';
-        }
 
-        // api.xanderglobalscholars.com → elearning.xanderglobalscholars.com
-        if (preg_match('#^https?://api\.(.+)$#i', $appUrl, $matches)) {
+        // When API runs on api.example.com, learner app is on elearning.example.com
+        if ($appUrl !== '' && preg_match('#^https?://api\.(.+)$#i', $appUrl, $matches)) {
             $scheme = str_starts_with(strtolower($appUrl), 'https://') ? 'https' : 'http';
 
             return $scheme . '://elearning.' . $matches[1];
         }
 
-        return $appUrl;
+        if ($appUrl !== '') {
+            return $appUrl;
+        }
+
+        return 'http://localhost:8080';
     }
 }
