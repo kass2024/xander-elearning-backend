@@ -210,6 +210,10 @@ Route::prefix('admin')->group(function () {
     Route::put('courses/{course}/materials/{material}', [CourseMaterialController::class, 'update']);
     Route::delete('courses/{course}/materials/{material}', [CourseMaterialController::class, 'destroy']);
     Route::post('courses/{course}/materials/upload-document', [CourseMaterialController::class, 'uploadDocument']);
+    Route::get('courses/{course}/materials/pcloud-upload-config', [CourseMaterialController::class, 'prepareDirectUpload']);
+    Route::post('courses/{course}/materials/register-pcloud', [CourseMaterialController::class, 'registerDirectUpload']);
+    Route::post('courses/{course}/materials/upload-pcloud', [CourseMaterialController::class, 'uploadPCloud']);
+    Route::get('courses/{course}/materials/{material}/stream', [CourseMaterialController::class, 'streamMaterial']);
 
     /*** ---------------- PAYMENTS ---------------- ***/
     Route::get('payments', [PaymentController::class, 'index']);

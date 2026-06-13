@@ -87,25 +87,24 @@ class CourseRevenueCalculator
             ->sum(DB::raw('COALESCE(courses.price, 0)'));
     }
 
+    /**
+     * Paid checkout revenue for one course (matches Payment Management "paid" rows).
+     */
     public static function courseRevenue(Course|int $course): float
     {
         $courseId = $course instanceof Course ? $course->id : $course;
 
-        return round(
-            self::paymentRevenue([$courseId]) + self::manualEnrollmentRevenue([$courseId]),
-            2
-        );
+        return round(self::paymentRevenue([$courseId]), 2);
     }
 
     /**
+     * Platform revenue = sum of paid payment records only (excludes pending/failed).
+     *
      * @param  list<int>|null  $courseIds
      */
     public static function totalRevenue(?array $courseIds = null): float
     {
-        return round(
-            self::paymentRevenue($courseIds) + self::manualEnrollmentRevenue($courseIds),
-            2
-        );
+        return round(self::paymentRevenue($courseIds), 2);
     }
 
     /**
@@ -153,14 +152,11 @@ class CourseRevenueCalculator
         $months = collect(range($monthsBack, 0))->map(fn ($i) => $now->copy()->subMonths($i)->format('Y-m'));
 
         $paymentRows = self::monthlyPaymentRevenue($since, $courseIds);
-        $manualRows = self::monthlyManualEnrollmentRevenue($since, $courseIds);
 
-        return $months->map(function ($month) use ($paymentRows, $manualRows) {
-            $amount = (float) ($paymentRows[$month] ?? 0) + (float) ($manualRows[$month] ?? 0);
-
+        return $months->map(function ($month) use ($paymentRows) {
             return [
                 'month' => Carbon::createFromFormat('Y-m', $month)->format('M Y'),
-                'amount' => round($amount, 2),
+                'amount' => round((float) ($paymentRows[$month] ?? 0), 2),
             ];
         })->values();
     }

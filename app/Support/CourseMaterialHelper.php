@@ -46,6 +46,12 @@ class CourseMaterialHelper
 
         }
 
+        if (in_array($type, ['image', 'audio'], true)) {
+
+            return $type;
+
+        }
+
         if (str_contains($url, '.mp4') || str_contains($url, 'video') || str_contains($url, 'youtube') || str_contains($url, 'vimeo')) {
 
             return 'video';
@@ -381,6 +387,20 @@ class CourseMaterialHelper
 
         $state = $kind === 'zoom' ? self::liveSessionState($material, $liveMeetingIds) : [];
 
+        $meta = is_array($material->metadata) ? $material->metadata : [];
+
+        $fileExtras = [];
+        if (\App\Support\MaterialFileHelper::isPCloudMaterial($meta)) {
+            $filename = (string) ($meta['filename'] ?? $material->title ?? 'file');
+            $fileExtras = [
+                'storage' => 'pcloud',
+                'pcloud_file_id' => (int) $meta['pcloud_file_id'],
+                'file_category' => $meta['category'] ?? \App\Support\MaterialFileHelper::categoryFromFilename($filename),
+                'file_size' => isset($meta['size']) ? (int) $meta['size'] : null,
+                'filename' => $filename,
+            ];
+        }
+
 
 
         return array_merge([
@@ -409,7 +429,7 @@ class CourseMaterialHelper
 
             'created_at' => $material->created_at?->toIso8601String(),
 
-        ], $state);
+        ], $state, $fileExtras);
 
     }
 

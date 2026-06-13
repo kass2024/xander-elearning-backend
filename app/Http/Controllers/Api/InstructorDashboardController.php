@@ -130,12 +130,8 @@ class InstructorDashboardController extends Controller
             ? collect()
             : CourseRevenueCalculator::monthlyPaymentRevenue($since, $courseIdList);
 
-        $manualEnrollmentRows = $courseIds->isEmpty()
-            ? collect()
-            : CourseRevenueCalculator::monthlyManualEnrollmentRevenue($since, $courseIdList);
-
-        $earningsByMonth = $months->map(function ($month) use ($paymentRows, $manualEnrollmentRows, $share) {
-            $revenue = (float) ($paymentRows[$month] ?? 0) + (float) ($manualEnrollmentRows[$month] ?? 0);
+        $earningsByMonth = $months->map(function ($month) use ($paymentRows, $share) {
+            $revenue = (float) ($paymentRows[$month] ?? 0);
 
             return [
                 'month' => Carbon::createFromFormat('Y-m', $month)->format('M Y'),

@@ -132,7 +132,7 @@ class AdminReportsController extends Controller
                 'totalInstructors' => User::where('role', 'instructor')->count(),
                 'totalEnrollments' => CourseEnrollment::count(),
                 'paidEnrollments' => CourseEnrollment::where('status', 'paid')->count(),
-                'totalRevenue' => CourseRevenueCalculator::totalRevenue(),
+                'totalRevenue' => round($stripeRevenue, 2),
                 'stripeRevenue' => round($stripeRevenue, 2),
                 'manualRevenue' => round($manualRevenue, 2),
                 'pendingInstructors' => $pendingInstructors,

@@ -55,4 +55,10 @@ return [
         'key'    => env('STRIPE_PUBLIC_KEY'),
     ],
 
+    'pcloud' => [
+        'access_token' => env('PCLOUD_ACCESS_TOKEN'),
+        'root_folder' => env('PCLOUD_ROOT_FOLDER', 'parrotacademy'),
+        'base_url' => env('PCLOUD_API_URL', 'https://api.pcloud.com'),
+    ],
+
 ];
