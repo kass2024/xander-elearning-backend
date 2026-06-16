@@ -193,19 +193,11 @@ class CourseMaterialController extends Controller
      */
     public function prepareDirectUpload(Course $course, PCloudService $pcloud)
     {
-        if (!$pcloud->isConfigured()) {
-            return response()->json([
-                'message' => 'pCloud is not configured. Set PCLOUD_ACCESS_TOKEN in the server .env file.',
-            ], 503);
-        }
-
-        try {
-            $pcloud->resolveApiHost();
-        } catch (\Throwable $e) {
-            return response()->json(['message' => $e->getMessage()], 503);
-        }
-
-        return response()->json($pcloud->directUploadConfig($course->id));
+        return response()->json([
+            'message' => 'Direct browser upload to pCloud is disabled. Refresh the site (Ctrl+F5) or redeploy the latest frontend build.',
+            'upload_mode' => 'api',
+            'use_endpoint' => '/courses/' . $course->id . '/materials/upload-pcloud',
+        ], 410);
     }
 
     /**
@@ -292,7 +284,7 @@ class CourseMaterialController extends Controller
             ], 201);
         } catch (\Throwable $e) {
             return response()->json([
-                'message' => 'Upload to pCloud failed: ' . $e->getMessage(),
+                'message' => $e->getMessage(),
             ], 502);
         }
     }

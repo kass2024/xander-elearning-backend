@@ -117,6 +117,7 @@ class PCloudService
                 'token_length' => strlen((string) $this->accessToken),
                 'email' => is_array($info) ? ($info['email'] ?? null) : null,
                 'upload_test' => $uploadTest,
+                'upload_implementation' => 'curl-bearer-v4',
             ];
         } catch (\Throwable $e) {
             return [
@@ -256,13 +257,61 @@ class PCloudService
      */
     protected function uploadQueryParams(array $params, string $filename): array
     {
-        unset($params['access_token'], $params['filename']);
+        unset($params['access_token'], $params['auth'], $params['filename']);
 
         return array_merge($params, [
             'access_token' => $this->accessToken,
             'filename' => $filename,
             'renameifexists' => 1,
         ]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function uploadAuthHeaders(): array
+    {
+        return ['Authorization: Bearer ' . $this->accessToken];
+    }
+
+    /**
+     * Copy Laravel temp upload to a stable path (some hosts invalidate getRealPath() before cURL runs).
+     */
+    protected function stableUploadPath(UploadedFile $file): string
+    {
+        $real = $file->getRealPath();
+        if (is_string($real) && $real !== '' && is_readable($real)) {
+            return $real;
+        }
+
+        $tmp = tempnam(sys_get_temp_dir(), 'pcloud_upload_');
+        if ($tmp === false) {
+            throw new \RuntimeException('Unable to create temp file for pCloud upload');
+        }
+
+        $src = fopen($real ?: $file->getPathname(), 'rb');
+        if ($src === false) {
+            @unlink($tmp);
+            throw new \RuntimeException('Unable to read uploaded file');
+        }
+
+        $dest = fopen($tmp, 'wb');
+        if ($dest === false) {
+            fclose($src);
+            @unlink($tmp);
+            throw new \RuntimeException('Unable to prepare temp file for pCloud upload');
+        }
+
+        try {
+            stream_copy_to_stream($src, $dest);
+        } finally {
+            fclose($src);
+            fclose($dest);
+        }
+
+        register_shutdown_function(static fn () => @unlink($tmp));
+
+        return $tmp;
     }
 
     /**
@@ -296,6 +345,7 @@ class PCloudService
             CURLOPT_POSTFIELDS => [
                 'file' => curl_file_create($filePath, $mime, $filename),
             ],
+            CURLOPT_HTTPHEADER => $this->uploadAuthHeaders(),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => 60,
             CURLOPT_TIMEOUT => 3600,
@@ -375,7 +425,10 @@ class PCloudService
         try {
             $response = Http::timeout(3600)
                 ->connectTimeout(60)
-                ->withHeaders(['Content-Type' => 'application/octet-stream'])
+                ->withHeaders([
+                    'Content-Type' => 'application/octet-stream',
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                ])
                 ->send('PUT', $url, ['body' => $handle]);
         } finally {
             fclose($handle);
@@ -392,36 +445,32 @@ class PCloudService
      */
     protected function uploadViaMultipartPost(array $params, string $filePath, string $filename): array
     {
-        unset($params['access_token'], $params['filename']);
+        unset($params['access_token'], $params['auth'], $params['filename']);
 
-        $url = $this->uploadBaseUrl() . '/uploadfile';
+        $url = $this->uploadBaseUrl() . '/uploadfile?' . http_build_query(
+            $this->uploadQueryParams($params, $filename),
+            '',
+            '&',
+            PHP_QUERY_RFC3986
+        );
+
         $handle = fopen($filePath, 'rb');
         if ($handle === false) {
             throw new \RuntimeException('Unable to read uploaded file');
         }
 
         $multipart = [
-            ['name' => 'folderid', 'contents' => (string) ($params['folderid'] ?? 0)],
-            ['name' => 'access_token', 'contents' => (string) $this->accessToken],
-            ['name' => 'renameifexists', 'contents' => '1'],
-            ['name' => 'filename', 'contents' => $filename],
-        ];
-
-        foreach (['nopartial', 'uploadoffset', 'uploadid'] as $key) {
-            if (array_key_exists($key, $params)) {
-                $multipart[] = ['name' => $key, 'contents' => (string) $params[$key]];
-            }
-        }
-
-        $multipart[] = [
-            'name' => 'file',
-            'contents' => $handle,
-            'filename' => $filename,
+            [
+                'name' => 'file',
+                'contents' => $handle,
+                'filename' => $filename,
+            ],
         ];
 
         try {
             $response = Http::timeout(3600)
                 ->connectTimeout(60)
+                ->withHeaders(['Authorization' => 'Bearer ' . $this->accessToken])
                 ->send('POST', $url, ['multipart' => $multipart]);
         } finally {
             fclose($handle);
@@ -667,9 +716,18 @@ class PCloudService
             $params['nopartial'] = 1;
         }
 
-        $response = $this->postUploadFile($params, $file->getRealPath(), $file->getClientOriginalName());
+        $uploadPath = $this->stableUploadPath($file);
+        $copied = $uploadPath !== $file->getRealPath();
 
-        $this->assertOk($response, 'Upload to pCloud failed');
+        try {
+            $response = $this->postUploadFile($params, $uploadPath, $file->getClientOriginalName());
+        } finally {
+            if ($copied && is_file($uploadPath)) {
+                @unlink($uploadPath);
+            }
+        }
+
+        $this->assertOk($response, 'pCloud upload');
 
         $meta = $response['metadata'][0] ?? $response['metadata'] ?? null;
         if (!is_array($meta)) {
@@ -687,7 +745,8 @@ class PCloudService
     protected function uploadLargeFile(int $folderId, UploadedFile $file): array
     {
         $chunkSize = 10 * 1024 * 1024;
-        $path = $file->getRealPath();
+        $path = $this->stableUploadPath($file);
+        $copied = $path !== $file->getRealPath();
         $totalSize = (int) $file->getSize();
         $filename = $file->getClientOriginalName();
         $uploadId = null;
@@ -737,6 +796,9 @@ class PCloudService
             }
         } finally {
             fclose($handle);
+            if ($copied && is_file($path)) {
+                @unlink($path);
+            }
         }
 
         $meta = $response['metadata'][0] ?? $response['metadata'] ?? null;
