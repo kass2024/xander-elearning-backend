@@ -17,6 +17,20 @@ class MailDeliveryService
         }, array_merge($context, ['to' => $to, 'type' => 'mailable']));
     }
 
+    public function sendToForInstitution(
+        ?int $platformInstitutionId,
+        string $to,
+        Mailable $mailable,
+        array $context = [],
+    ): bool {
+        return app(InstitutionMailResolver::class)->sendForInstitution(
+            $platformInstitutionId,
+            $to,
+            $mailable,
+            array_merge($context, ['type' => 'mailable']),
+        );
+    }
+
     public function sendView(string $view, array $data, callable $callback, array $context = []): bool
     {
         return $this->attempt(function () use ($view, $data, $callback) {

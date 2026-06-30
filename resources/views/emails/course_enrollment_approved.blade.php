@@ -38,8 +38,11 @@
         <p class="paragraph" style="margin-bottom: 4px;">
           - You can now access your course materials from your learner dashboard under <strong>My Courses</strong>.
         </p>
-        <p class="paragraph" style="margin-bottom: 0;">
+        <p class="paragraph" style="margin-bottom: 4px;">
           - Watch your email and dashboard for class schedules, Zoom links and further instructions.
+        </p>
+        <p class="paragraph" style="margin-bottom: 0;">
+          - Course payment can be completed later when you receive a payment link from our team.
         </p>
       </div>
       <p class="paragraph">

@@ -7,10 +7,12 @@ use App\Models\Course;
 use App\Models\CourseEnrollment;
 use App\Models\CourseMaterial;
 use App\Models\InstructorPayoutRequest;
+use App\Models\StudyShift;
+use App\Support\InstructorPayoutMethods;
 use App\Models\User;
 use App\Support\CourseMaterialHelper;
 use App\Support\QuizMaterialHelper;
-use App\Support\CourseRevenueCalculator;
+use App\Support\CourseDetailsHelper;
 use App\Services\ZoomService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -204,6 +206,9 @@ class InstructorDashboardController extends Controller
                 'id' => $row->id,
                 'amount' => (float) $row->amount,
                 'status' => $row->status,
+                'payment_method' => $row->payment_method,
+                'payment_method_label' => $row->payment_method_label,
+                'payment_details' => $row->payment_details,
                 'notes' => $row->notes,
                 'created_at' => $row->created_at?->toIso8601String(),
             ])
@@ -416,7 +421,7 @@ class InstructorDashboardController extends Controller
 
         $courseIds = $this->courseIdsFor($instructor);
         if ($courseIds->isEmpty()) {
-            return response()->json(['students' => [], 'courses' => []], 200);
+            return response()->json(['students' => [], 'courses' => [], 'study_shifts' => []], 200);
         }
 
         $courses = Course::query()
@@ -424,9 +429,20 @@ class InstructorDashboardController extends Controller
             ->orderBy('title')
             ->get(['id', 'title']);
 
-        $rows = CourseEnrollment::query()
-            ->with(['student', 'course'])
-            ->whereIn('course_id', $courseIds)
+        $studyShiftId = $request->query('study_shift_id');
+
+        $enrollmentQuery = CourseEnrollment::query()
+            ->with(['student', 'course', 'studyShifts'])
+            ->whereIn('course_id', $courseIds);
+
+        if ($studyShiftId) {
+            $enrollmentQuery->where(function ($q) use ($studyShiftId) {
+                $q->whereHas('studyShifts', fn ($sub) => $sub->where('study_shifts.id', (int) $studyShiftId))
+                    ->orWhere('study_shift_id', (int) $studyShiftId);
+            });
+        }
+
+        $rows = $enrollmentQuery
             ->orderByDesc('created_at')
             ->get()
             ->map(function (CourseEnrollment $enrollment) {
@@ -434,6 +450,8 @@ class InstructorDashboardController extends Controller
                 if (!$student) {
                     return null;
                 }
+
+                $studyShifts = $this->formatStudyShifts($enrollment->studyShifts);
 
                 return [
                     'enrollment_id' => $enrollment->id,
@@ -443,43 +461,86 @@ class InstructorDashboardController extends Controller
                     'country' => $student->country ?? null,
                     'course_id' => $enrollment->course_id,
                     'course_title' => $enrollment->course->title ?? 'Course',
+                    'course_price' => (float) ($enrollment->course->price ?? 0),
                     'status' => $enrollment->status,
+                    'payment_paid' => \App\Support\EnrollmentStatusHelper::isPaid($enrollment->status),
+                    'has_access' => \App\Support\EnrollmentStatusHelper::hasCourseAccess($enrollment->status),
                     'enrolled_at' => $enrollment->created_at?->toIso8601String(),
+                    'study_shifts' => $studyShifts,
                 ];
             })
             ->filter()
             ->values();
 
+        $availableShifts = StudyShift::query()
+            ->whereIn('course_id', $courseIds)
+            ->where('is_active', true)
+            ->orderBy('day_of_week')
+            ->orderBy('start_time')
+            ->get()
+            ->map(fn (StudyShift $shift) => $this->formatStudyShift($shift));
+
         return response()->json([
             'courses' => $courses,
             'students' => $rows,
+            'study_shifts' => $availableShifts,
         ], 200);
+    }
+
+    private function formatStudyShifts($shifts): array
+    {
+        return collect($shifts)->map(fn (StudyShift $shift) => $this->formatStudyShift($shift))->values()->all();
+    }
+
+    private function formatStudyShift(StudyShift $shift): array
+    {
+        $dayNames = [0 => 'Sun', 1 => 'Mon', 2 => 'Tue', 3 => 'Wed', 4 => 'Thu', 5 => 'Fri', 6 => 'Sat'];
+        $dayLabel = $dayNames[(int) $shift->day_of_week] ?? 'Day';
+        $start = substr((string) $shift->start_time, 0, 5);
+        $end = substr((string) $shift->end_time, 0, 5);
+
+        return [
+            'id' => $shift->id,
+            'course_id' => $shift->course_id,
+            'name' => $shift->name,
+            'day_of_week' => (int) $shift->day_of_week,
+            'day_label' => $dayLabel,
+            'start_time' => $start,
+            'end_time' => $end,
+            'label' => sprintf('%s · %s %s–%s', $shift->name, $dayLabel, $start, $end),
+        ];
     }
 
     public function createCourse(Request $request)
     {
-        $data = $request->validate([
+        $data = $request->validate(array_merge([
             'instructor_email' => 'required|email',
+            'program_id' => 'required|integer|exists:elearning_programs,id',
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
             'price' => 'nullable|numeric|min:0',
             'duration' => 'nullable|string|max:255',
             'requirements' => 'nullable|string',
-        ]);
+        ], CourseDetailsHelper::validationRules()));
 
         $instructor = $this->findInstructor($data['instructor_email']);
         if (!$instructor) {
             return response()->json(['message' => 'Instructor not found'], 404);
         }
 
-        $course = Course::create([
+        $details = CourseDetailsHelper::extractFromRequest($request);
+        $payload = [
+            'program_id' => $data['program_id'],
             'title' => $data['title'],
             'description' => $data['description'] ?? null,
             'price' => $data['price'] ?? 0,
             'duration' => $data['duration'] ?? null,
             'requirements' => $data['requirements'] ?? null,
             'status' => 'Pending',
-        ]);
+        ];
+        CourseDetailsHelper::applyToPayload($payload, $details, $data['title']);
+
+        $course = Course::create($payload);
 
         $instructor->assignedCourses()->syncWithoutDetaching([$course->id]);
 
@@ -487,6 +548,58 @@ class InstructorDashboardController extends Controller
             'message' => 'Course submitted for admin approval.',
             'course' => $course,
         ], 201);
+    }
+
+    public function updateCourse(Request $request, Course $course)
+    {
+        $data = $request->validate(array_merge([
+            'instructor_email' => 'required|email',
+            'program_id' => 'sometimes|required|integer|exists:elearning_programs,id',
+            'title' => 'sometimes|required|string|max:255',
+            'description' => 'nullable|string',
+            'price' => 'nullable|numeric|min:0',
+            'duration' => 'nullable|string|max:255',
+            'requirements' => 'nullable|string',
+        ], CourseDetailsHelper::validationRules($course->id)));
+
+        $instructor = $this->findInstructor($data['instructor_email']);
+        if (!$instructor) {
+            return response()->json(['message' => 'Instructor not found'], 404);
+        }
+
+        if (!$instructor->assignedCourses()->where('courses.id', $course->id)->exists()) {
+            return response()->json(['message' => 'You are not assigned to this course.'], 403);
+        }
+
+        $details = CourseDetailsHelper::extractFromRequest($request);
+
+        $payload = [];
+        foreach (['program_id', 'title', 'description', 'price', 'duration', 'requirements'] as $field) {
+            if (array_key_exists($field, $data)) {
+                $payload[$field] = $data[$field];
+            }
+        }
+
+        CourseDetailsHelper::applyToPayload($payload, $details, $course->title ?? $data['title'] ?? null);
+
+        $course->fill($payload);
+        $course->save();
+
+        \App\Support\ApiListCache::bump('courses');
+
+        return response()->json([
+            'message' => 'Course updated.',
+            'course' => $course->fresh(),
+        ], 200);
+    }
+
+    public function payoutPaymentOptions()
+    {
+        $options = collect(InstructorPayoutMethods::options())
+            ->map(fn (string $label, string $value) => ['value' => $value, 'label' => $label])
+            ->values();
+
+        return response()->json(['paymentMethods' => $options], 200);
     }
 
     public function payoutRequests(Request $request)
@@ -514,6 +627,8 @@ class InstructorDashboardController extends Controller
         $data = $request->validate([
             'instructor_email' => 'required|email',
             'amount' => 'required|numeric|min:1',
+            'payment_method' => 'required|string|in:' . implode(',', InstructorPayoutMethods::keys()),
+            'payment_details' => 'nullable|string|max:500',
             'notes' => 'nullable|string|max:500',
         ]);
 
@@ -535,6 +650,8 @@ class InstructorDashboardController extends Controller
             'instructor_id' => $instructor->id,
             'amount' => round((float) $data['amount'], 2),
             'status' => 'pending',
+            'payment_method' => $data['payment_method'],
+            'payment_details' => $data['payment_details'] ?? null,
             'notes' => $data['notes'] ?? null,
         ]);
 

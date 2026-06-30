@@ -8,7 +8,9 @@ use App\Models\CourseEnrollment;
 use App\Models\CourseMaterial;
 use App\Services\PCloudService;
 use App\Services\ZoomService;
+use App\Support\CourseDetailsHelper;
 use App\Support\CourseMaterialHelper;
+use App\Support\EnrollmentStatusHelper;
 use App\Support\LearnerRecordingAccess;
 use App\Support\MaterialFileHelper;
 use Illuminate\Http\Request;
@@ -53,22 +55,31 @@ class CourseMaterialController extends Controller
         $enrollment = CourseEnrollment::query()
             ->where('student_id', $studentId)
             ->where('course_id', $course->id)
-            ->whereIn('status', ['paid', 'completed', 'active', 'approved', 'enrolled'])
             ->first();
 
-        if (!$enrollment) {
+        if (!$enrollment || !EnrollmentStatusHelper::canViewCourseGuide($enrollment->status)) {
             return response()->json([
-                'message' => 'You must complete payment for this course before accessing materials.',
+                'message' => 'You must apply for this course before viewing it.',
             ], 403);
         }
 
+        $hasAccess = EnrollmentStatusHelper::hasCourseAccess($enrollment->status);
+
         return response()->json([
-            'course' => [
+            'course' => array_merge([
                 'id' => $course->id,
                 'title' => $course->title,
                 'description' => $course->description,
-            ],
-            'materials' => $this->buildCourseMaterialsPayload($course, true, (int) $studentId),
+                'price' => (float) ($course->price ?? 0),
+                'duration' => $course->duration,
+                'requirements' => $course->requirements,
+                'enrollment_status' => $enrollment->status,
+                'payment_paid' => EnrollmentStatusHelper::isPaid($enrollment->status),
+                'has_access' => $hasAccess,
+            ], CourseDetailsHelper::toArray($course)),
+            'materials' => $hasAccess
+                ? $this->buildCourseMaterialsPayload($course, true, (int) $studentId)
+                : [],
         ], 200);
     }
 
@@ -106,15 +117,37 @@ class CourseMaterialController extends Controller
                 ->values()
                 ->all();
 
-            $liveMeetingIds = app(ZoomService::class)->fetchLiveMeetingIds();
-            $recordingsByMeetingId = LearnerRecordingAccess::filterGroupedRecordings(
-                app(ZoomService::class)->recordingsGroupedByMeetingId(),
-                $courseMeetingIds
-            );
+            try {
+                $liveMeetingIds = app(ZoomService::class)->fetchLiveMeetingIds();
+                $recordingsByMeetingId = LearnerRecordingAccess::filterGroupedRecordings(
+                    app(ZoomService::class)->recordingsGroupedByMeetingId(),
+                    $courseMeetingIds
+                );
+            } catch (\Throwable) {
+                $liveMeetingIds = [];
+                $recordingsByMeetingId = [];
+            }
+        }
+
+        $latestAttemptsByQuiz = [];
+        if ($studentId) {
+            $quizMaterialIds = $materials
+                ->filter(fn (CourseMaterial $m) => in_array($m->type, ['quiz', 'assessment'], true))
+                ->pluck('id');
+
+            if ($quizMaterialIds->isNotEmpty()) {
+                $latestAttemptsByQuiz = \App\Models\QuizAttempt::query()
+                    ->where('student_id', $studentId)
+                    ->whereIn('course_material_id', $quizMaterialIds)
+                    ->orderByDesc('id')
+                    ->get()
+                    ->unique('course_material_id')
+                    ->keyBy('course_material_id');
+            }
         }
 
         return $materials
-            ->map(function (CourseMaterial $m) use ($liveMeetingIds, $recordingsByMeetingId) {
+            ->map(function (CourseMaterial $m) use ($liveMeetingIds, $recordingsByMeetingId, $latestAttemptsByQuiz) {
                 $arr = CourseMaterialHelper::toLearnerArray($m, $liveMeetingIds);
 
                 if (($arr['kind'] ?? '') === 'zoom') {
@@ -122,6 +155,11 @@ class CourseMaterialController extends Controller
                     $arr['recordings'] = ($meetingId && isset($recordingsByMeetingId[$meetingId]))
                         ? $recordingsByMeetingId[$meetingId]
                         : [];
+                }
+
+                $attempt = $latestAttemptsByQuiz[$m->id] ?? null;
+                if ($attempt instanceof \App\Models\QuizAttempt) {
+                    $arr['latest_attempt'] = $attempt->toLearnerSummary();
                 }
 
                 return $arr;
@@ -334,11 +372,7 @@ class CourseMaterialController extends Controller
 
         $studentId = $request->query('student_id');
         if ($studentId) {
-            $allowed = CourseEnrollment::query()
-                ->where('student_id', $studentId)
-                ->where('course_id', $ownerCourse->id)
-                ->whereIn('status', ['paid', 'completed'])
-                ->exists();
+            $allowed = LearnerRecordingAccess::hasCourseAccess((int) $studentId, (int) $ownerCourse->id);
 
             if (!$allowed) {
                 return response()->json(['message' => 'Access denied'], 403);

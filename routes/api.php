@@ -1,5 +1,6 @@
 <?php
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Api\ElearningProgramController;
 use App\Http\Controllers\Api\ProgramManagementController;
 use App\Http\Controllers\Api\AgentController;
 use App\Http\Controllers\Api\ApplicationController;
@@ -14,6 +15,7 @@ use App\Http\Controllers\Api\StudentDashboardController;
 use App\Http\Controllers\Api\LearnerExtrasController;
 use App\Http\Controllers\Api\MeetingRegistrationController;
 use App\Http\Controllers\Api\AvailableScheduleController;
+use App\Http\Controllers\Api\StudyShiftController;
 use App\Http\Controllers\Api\LiveZoomCohortController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\AdminPayoutController;
@@ -21,7 +23,11 @@ use App\Http\Controllers\Api\AdminReportsController;
 use App\Http\Controllers\Api\SystemController;
 use App\Http\Controllers\Api\InstructorDashboardController;
 use App\Http\Controllers\Api\QuizController;
+use App\Http\Controllers\Api\PlatformInstitutionController;
+use App\Http\Controllers\Api\InstitutionSignupController;
+use App\Http\Controllers\Api\PublicStorageController;
 use App\Http\Controllers\Api\LearnerDashboardController;
+use App\Http\Controllers\Api\StudyShiftChangeRequestController;
 use App\Http\Controllers\Api\CertificateController;
 use App\Services\ZoomService;
 
@@ -41,11 +47,20 @@ Route::prefix('admin')->group(function () {
     Route::get('system/health', [SystemController::class, 'health']);
     Route::get('system/pcloud', [SystemController::class, 'pcloudHealth']);
     Route::post('system/migrate', [SystemController::class, 'migrate']);
+    Route::get('public-storage/{path}', [PublicStorageController::class, 'show'])->where('path', '.*');
 
     // Auth
     Route::post('auth/login', [AuthController::class, 'login']);
     Route::post('auth/register-student', [AuthController::class, 'registerStudent']);
     Route::post('auth/register-instructor', [AuthController::class, 'registerInstructor']);
+    Route::get('institution-signup/config', [InstitutionSignupController::class, 'config']);
+    Route::get('institution-signup/choices', [InstitutionSignupController::class, 'choices']);
+    Route::post('institution-signup/validate-promo', [InstitutionSignupController::class, 'validatePromo']);
+    Route::post('institution-signup/register', [InstitutionSignupController::class, 'register']);
+    Route::post('institution-signup/complete-payment', [InstitutionSignupController::class, 'completePayment']);
+    Route::get('platform-institutions/context', [PlatformInstitutionController::class, 'context']);
+    Route::get('platform-institutions/my-settings', [PlatformInstitutionController::class, 'mySettings']);
+    Route::post('platform-institutions/my-branding', [PlatformInstitutionController::class, 'updateMyBranding']);
     Route::patch('auth/profile', [AuthController::class, 'updateProfile']);
     Route::post('auth/change-password', [AuthController::class, 'changePassword']);
     Route::get('auth/google/redirect', [AuthController::class, 'redirectToGoogle']);
@@ -68,13 +83,22 @@ Route::prefix('admin')->group(function () {
 
     // Available Schedule (Time Slots)
     Route::get('available-schedules', [AvailableScheduleController::class, 'index']);
+    Route::put('available-schedules/calendar', [AvailableScheduleController::class, 'updateCalendar']);
+    Route::post('available-schedules/bulk', [AvailableScheduleController::class, 'bulkUpsert']);
     Route::post('available-schedules', [AvailableScheduleController::class, 'store']);
     Route::put('available-schedules/{availableSchedule}', [AvailableScheduleController::class, 'update']);
     Route::delete('available-schedules/{availableSchedule}', [AvailableScheduleController::class, 'destroy']);
 
+    // Study shifts (learner registration)
+    Route::get('study-shifts', [StudyShiftController::class, 'index']);
+    Route::post('study-shifts', [StudyShiftController::class, 'store']);
+    Route::put('study-shifts/{studyShift}', [StudyShiftController::class, 'update']);
+    Route::delete('study-shifts/{studyShift}', [StudyShiftController::class, 'destroy']);
+
     // Live Zoom Cohort (separate table)
     Route::get('livezoom-cohort', [LiveZoomCohortController::class, 'index']);
     Route::post('livezoom-cohort', [LiveZoomCohortController::class, 'store']);
+    Route::post('livezoom-cohort/bulk', [LiveZoomCohortController::class, 'bulkUpsert']);
     Route::put('livezoom-cohort/{liveZoomCohort}', [LiveZoomCohortController::class, 'update']);
     Route::delete('livezoom-cohort/{liveZoomCohort}', [LiveZoomCohortController::class, 'destroy']);
     Route::get('livezoom-cohort/{liveZoomCohort}/public', [LiveZoomCohortController::class, 'publicSession']);
@@ -98,6 +122,15 @@ Route::prefix('admin')->group(function () {
     Route::post('livezoom-cohort/{liveZoomCohort}/host/mark-in-meeting', [LiveZoomCohortController::class, 'markHostInMeeting']);
     Route::post('livezoom-cohort/{liveZoomCohort}/host/mark-left', [LiveZoomCohortController::class, 'markHostLeft']);
     Route::post('livezoom-cohort/{liveZoomCohort}/recording', [LiveZoomCohortController::class, 'toggleRecording']);
+
+    /*** ---------------- E-LEARNING PROGRAMS ---------------- ***/
+    Route::get('learning-programs', [ElearningProgramController::class, 'index']);
+    Route::post('learning-programs', [ElearningProgramController::class, 'store']);
+    Route::get('learning-programs/{elearningProgram}', [ElearningProgramController::class, 'show']);
+    Route::put('learning-programs/{elearningProgram}', [ElearningProgramController::class, 'update']);
+    Route::delete('learning-programs/{elearningProgram}', [ElearningProgramController::class, 'destroy']);
+    Route::post('learning-programs/{elearningProgram}/assign-courses', [ElearningProgramController::class, 'assignCourses']);
+    Route::post('learning-programs/auto-assign-courses', [ElearningProgramController::class, 'autoAssignCourses']);
 
     /*** ---------------- DESTINATIONS ---------------- ***/
     Route::get('destinations', [ProgramManagementController::class, 'getDestinations']);
@@ -149,6 +182,7 @@ Route::prefix('admin')->group(function () {
     Route::get('students', [StudentController::class, 'index']);
     Route::post('students', [StudentController::class, 'store']);
     Route::put('students/{student}', [StudentController::class, 'update']);
+    Route::post('students/{student}/move-institution', [StudentController::class, 'moveInstitution']);
     Route::delete('students/{student}', [StudentController::class, 'destroy']);
     Route::post('students/upload-document', [StudentController::class, 'uploadDocument']);
     Route::post('students/test-email', [StudentController::class, 'testEmail']);
@@ -158,6 +192,11 @@ Route::prefix('admin')->group(function () {
     Route::get('learner/dashboard', [LearnerDashboardController::class, 'dashboard']);
     Route::get('learner/notifications', [LearnerDashboardController::class, 'notifications']);
     Route::get('learner/recordings', [LearnerDashboardController::class, 'recordings']);
+    Route::post('learner/study-shift-change-requests', [StudyShiftChangeRequestController::class, 'store']);
+    Route::get('study-shift-change-requests', [StudyShiftChangeRequestController::class, 'index']);
+    Route::post('study-shift-change-requests/{studyShiftChangeRequest}/approve', [StudyShiftChangeRequestController::class, 'approve']);
+    Route::post('study-shift-change-requests/{studyShiftChangeRequest}/reject', [StudyShiftChangeRequestController::class, 'reject']);
+    Route::post('courses/{course}/enrollment-study-shifts', [StudyShiftChangeRequestController::class, 'updateEnrollmentShifts']);
     Route::post('learner/live-classes/{material}/sdk-auth', [ZoomEmbedController::class, 'learnerMaterialAuth']);
     Route::get('learner/courses/{course}/materials', [CourseMaterialController::class, 'learnerIndex']);
 
@@ -183,18 +222,42 @@ Route::prefix('admin')->group(function () {
     Route::get('instructor/quizzes/topics', [QuizController::class, 'courseTopics']);
     Route::post('instructor/quizzes/analyze-material', [QuizController::class, 'analyzeMaterial']);
     Route::post('instructor/quizzes/generate', [QuizController::class, 'generate']);
+    Route::post('instructor/quizzes/upload-prompt-audio', [QuizController::class, 'uploadPromptAudio']);
+    Route::get('instructor/quizzes/pcloud-upload-config', [QuizController::class, 'prepareQuizAudioUpload']);
+    Route::post('instructor/quizzes/register-prompt-audio', [QuizController::class, 'registerQuizPromptAudio']);
+    Route::get('courses/{course}/assessment-audio/stream', [QuizController::class, 'streamAssessmentAudio']);
     Route::post('instructor/quizzes/ai', [QuizController::class, 'store']);
     Route::get('instructor/quizzes/{quiz}', [QuizController::class, 'showForInstructor']);
     Route::put('instructor/quizzes/{quiz}', [QuizController::class, 'update']);
     Route::post('instructor/quizzes/{quiz}/publish', [QuizController::class, 'publish']);
     Route::get('instructor/quizzes/{quiz}/analytics', [QuizController::class, 'analytics']);
+    Route::get('instructor/quizzes/{quiz}/attempts', [QuizController::class, 'listAttempts']);
+    Route::get('instructor/quizzes/{quiz}/attempts/{attempt}/marking-guide', [QuizController::class, 'downloadMarkingGuide']);
+    Route::post('instructor/quizzes/{quiz}/attempts/{attempt}/grade', [QuizController::class, 'gradeAttempt']);
     Route::get('learner/quizzes/{quiz}', [QuizController::class, 'showForLearner']);
+    Route::get('learner/quizzes/{quiz}/attempts/{attempt}/marking-guide', [QuizController::class, 'downloadMarkingGuide']);
+    Route::post('learner/quizzes/{quiz}/upload-answer-audio', [QuizController::class, 'uploadAnswerAudio']);
     Route::post('learner/quizzes/{quiz}/submit', [QuizController::class, 'submit']);
     Route::post('instructor/courses', [InstructorDashboardController::class, 'createCourse']);
+    Route::put('instructor/courses/{course}', [InstructorDashboardController::class, 'updateCourse']);
+    Route::get('instructor/payout-payment-options', [InstructorDashboardController::class, 'payoutPaymentOptions']);
     Route::get('instructor/payout-requests', [InstructorDashboardController::class, 'payoutRequests']);
     Route::post('instructor/payout-requests', [InstructorDashboardController::class, 'requestPayout']);
 
     Route::post('users', [UserController::class, 'store']);
+    Route::get('platform-institutions', [PlatformInstitutionController::class, 'index']);
+    Route::get('platform-institutions/{platformInstitution}', [PlatformInstitutionController::class, 'show']);
+    Route::put('platform-institutions/{platformInstitution}', [PlatformInstitutionController::class, 'update']);
+    Route::post('platform-institutions/{platformInstitution}/test-mail', [PlatformInstitutionController::class, 'sendTestMail']);
+    Route::post('platform-institutions/{platformInstitution}/approve', [PlatformInstitutionController::class, 'approve']);
+    Route::post('platform-institutions/{platformInstitution}/disable', [PlatformInstitutionController::class, 'disable']);
+    Route::post('platform-institutions/{platformInstitution}/enable', [PlatformInstitutionController::class, 'enable']);
+    Route::post('platform-institutions/{platformInstitution}/resend-credentials', [PlatformInstitutionController::class, 'resendCredentials']);
+    Route::post('platform-institutions/{platformInstitution}/payment-reminder', [PlatformInstitutionController::class, 'sendPaymentReminder']);
+    Route::post('platform-institutions/{platformInstitution}/logo', [PlatformInstitutionController::class, 'uploadLogo']);
+    Route::delete('platform-institutions/{platformInstitution}', [PlatformInstitutionController::class, 'destroy']);
+    Route::get('institution-promo-codes', [PlatformInstitutionController::class, 'promoCodes']);
+    Route::post('institution-promo-codes', [PlatformInstitutionController::class, 'storePromoCode']);
     Route::put('users/{user}', [UserController::class, 'update']);
     Route::delete('users/{user}', [UserController::class, 'destroy']);
 
@@ -230,6 +293,7 @@ Route::prefix('admin')->group(function () {
     Route::post('instructor-payouts/{payout}/reject', [AdminPayoutController::class, 'reject']);
 
     /*** ---------------- COURSES ---------------- ***/
+    Route::get('courses/suggest-code', [CourseController::class, 'suggestCode']);
     Route::get('courses', [CourseController::class, 'index']);
     Route::post('courses', [CourseController::class, 'store']);
     Route::put('courses/{course}', [CourseController::class, 'update']);
@@ -241,6 +305,8 @@ Route::prefix('admin')->group(function () {
     Route::post('courses/{course}/schedule-class', [CourseController::class, 'scheduleClass']);
     Route::post('courses/{course}/mark-paid', [CourseController::class, 'markPaid']);
     Route::post('courses/{course}/reject-enrollment', [CourseController::class, 'rejectEnrollment']);
+    Route::post('courses/{course}/remove-enrollment', [CourseController::class, 'removeEnrollment']);
+    Route::post('courses/{course}/send-payment-link', [CourseController::class, 'sendPaymentLink']);
     Route::get('courses/{course}/enrolled-students', [CourseController::class, 'enrolledStudents']);
 
     // Course materials

@@ -68,7 +68,7 @@ class QuizDocumentEngine
             ];
         }
 
-        $limit = min(12, max(3, (int) ceil($questionCount * 0.75)));
+        $limit = min(8, max(3, (int) ceil($questionCount * 0.5)));
         $retrieval = 'keyword';
         $selected = $this->retrieveRelevantChunks($allChunks, $topic, $limit);
 
@@ -87,8 +87,9 @@ class QuizDocumentEngine
         })->implode("\n\n---\n\n");
 
         $configuredMax = (int) config('services.quiz_ai.max_material_chars', 18000);
+        $perQuestion = (int) config('services.quiz_ai.fast_context_chars_per_question', 900);
         $maxChars = $fastMode
-            ? min($configuredMax, max(5000, $questionCount * 2200))
+            ? min($configuredMax, max(4000, $questionCount * $perQuestion))
             : $configuredMax;
         $context = \Illuminate\Support\Str::limit($context, $maxChars, "\n\n[Truncated for model context.]");
 

@@ -6,16 +6,31 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use App\Models\User;
 use App\Support\ApiListCache;
+use App\Support\PlatformTenantScope;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Schema;
 
 class UserController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
+        $tenantId = PlatformTenantScope::resolveTenantId($request);
+
+        if ($tenantId !== null) {
+            $users = User::query()
+                ->select(['id', 'name', 'email', 'role', 'status', 'phone', 'platform_institution_id', 'created_at'])
+                ->where('platform_institution_id', $tenantId)
+                ->with('platformInstitution:id,name,logo_path,logo_url,status,payment_status')
+                ->orderByDesc('id')
+                ->get();
+
+            return response()->json($users, 200);
+        }
+
         $users = ApiListCache::remember('users', 'all', 120, function () {
             return User::query()
-                ->select(['id', 'name', 'email', 'role', 'status', 'phone', 'created_at'])
+                ->select(['id', 'name', 'email', 'role', 'status', 'phone', 'platform_institution_id', 'created_at'])
+                ->with('platformInstitution:id,name,logo_path,logo_url,status,payment_status')
                 ->orderByDesc('id')
                 ->get();
         });
@@ -23,8 +38,22 @@ class UserController extends Controller
         return response()->json($users, 200);
     }
 
-    public function instructorsWithCourses()
+    public function instructorsWithCourses(Request $request)
     {
+        $tenantId = PlatformTenantScope::resolveTenantId($request);
+
+        if ($tenantId !== null) {
+            $instructors = User::query()
+                ->where('role', 'instructor')
+                ->where('platform_institution_id', $tenantId)
+                ->select(['id', 'name', 'email', 'role', 'status', 'phone', 'platform_institution_id'])
+                ->with(['assignedCourses:id,title,status,platform_institution_id'])
+                ->orderByDesc('id')
+                ->get();
+
+            return response()->json($instructors, 200);
+        }
+
         $instructors = ApiListCache::remember('instructors', 'with_courses', 120, function () {
             return User::query()
                 ->where('role', 'instructor')
@@ -99,7 +128,7 @@ class UserController extends Controller
 
         $user = $request->user();
         $user->update([
-            'password' => Hash::make($request->new_password),
+            'password' => $request->new_password,
         ]);
 
         return response()->json([
@@ -116,6 +145,7 @@ class UserController extends Controller
             'role' => 'nullable|string|max:50',
             'status' => 'nullable|string|max:50',
             'phone' => 'nullable|string|max:50',
+            'platform_institution_id' => 'nullable|integer|exists:platform_institutions,id',
         ]);
 
         $currentUser = auth()->user();
@@ -140,9 +170,9 @@ class UserController extends Controller
         }
 
         if (!empty($data['password'])) {
-            $data['password'] = Hash::make($data['password']);
-        } elseif ($data['role'] === 'instructor') {
-            $data['password'] = Hash::make('12345678');
+            // plain — User model `hashed` cast hashes on save
+        } elseif ($data['role'] === 'instructor' || $data['role'] === 'partner_company') {
+            $data['password'] = '12345678';
         }
 
         if (empty($data['status'])) {
@@ -153,6 +183,8 @@ class UserController extends Controller
         if (!array_key_exists('phone', $data) || $data['phone'] === null) {
             $data['phone'] = '';
         }
+
+        PlatformTenantScope::stampInstitutionId($request, $data);
 
         $user = User::create($data);
 
@@ -173,7 +205,7 @@ class UserController extends Controller
         $data = $request->validate([
             'password' => 'required|string|min:6',
         ]);
-        $user->password = Hash::make($data['password']);
+        $user->password = $data['password'];
         $user->save();
         return response()->json(['message' => 'Password updated', 'user' => $user->makeHidden(['password'])]);
     }
@@ -205,6 +237,7 @@ class UserController extends Controller
             'role' => 'nullable|string|max:50',
             'status' => 'nullable|string|max:50',
             'phone' => 'nullable|string|max:50',
+            'platform_institution_id' => 'nullable|integer|exists:platform_institutions,id',
         ]);
 
         $currentUser = auth()->user();
@@ -220,9 +253,7 @@ class UserController extends Controller
             ], 403);
         }
 
-        if (!empty($data['password'])) {
-            $data['password'] = Hash::make($data['password']);
-        } else {
+        if (empty($data['password'])) {
             unset($data['password']);
         }
 

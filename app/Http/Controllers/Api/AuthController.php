@@ -12,6 +12,10 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use App\Services\StudentRegistrationEmailService;
+use App\Support\PlatformUserService;
+use App\Support\PlatformInstitutionHelper;
+use App\Models\PlatformInstitution;
+use Illuminate\Database\QueryException;
 
 class AuthController extends Controller
 {
@@ -65,6 +69,7 @@ class AuthController extends Controller
             'primary_goal' => 'nullable|string',
             'selected_courses' => 'nullable|array',
             'selected_courses.*' => 'nullable|string|max:255',
+            'platform_institution_id' => 'nullable|integer|exists:platform_institutions,id',
         ]);
 
         try {
@@ -86,6 +91,20 @@ class AuthController extends Controller
             $student->primary_goal = $data['primary_goal'] ?? '';
             $plainPassword = $data['password'];
             $student->password = Hash::make($plainPassword);
+
+            $institutionId = $data['platform_institution_id'] ?? null;
+            if ($institutionId) {
+                $institution = PlatformInstitution::query()
+                    ->where('id', $institutionId)
+                    ->where('status', 'active')
+                    ->first();
+                if (!$institution) {
+                    DB::rollBack();
+                    return response()->json(['message' => 'Selected institution is not available.'], 422);
+                }
+                $student->platform_institution_id = $institution->id;
+            }
+
             $student->save();
 
             $selectedCourses = $data['selected_courses'] ?? [];
@@ -132,7 +151,7 @@ class AuthController extends Controller
             $user = User::create([
                 'name' => $data['name'],
                 'email' => $data['email'],
-                'password' => Hash::make($data['password']),
+                'password' => $data['password'],
                 'role' => 'instructor',
                 'status' => 'Pending',
                 'phone' => $data['phone'] ?? '',
@@ -162,7 +181,7 @@ class AuthController extends Controller
             'password' => 'required|string',
         ]);
 
-        $username = $data['username'];
+        $username = PlatformUserService::normalizeEmail($data['username']);
         $password = $data['password'];
 
         $defaultPassword = '12345678';
@@ -183,10 +202,15 @@ class AuthController extends Controller
         };
 
         // Try Students table first (treated as learners)
-        $student = Student::where('email', $username)
-            ->orWhere('first_name', $username)
-            ->orWhere('last_name', $username)
-            ->first();
+        try {
+            $student = Student::where('email', $username)
+                ->orWhere('first_name', $username)
+                ->orWhere('last_name', $username)
+                ->first();
+        } catch (QueryException $e) {
+            $student = null;
+        }
+
         if ($student && $verify($student)) {
             $studentStatus = strtolower(trim((string) ($student->status ?? 'active')));
             if (in_array($studentStatus, ['pending', 'inactive', 'rejected'], true)) {
@@ -195,16 +219,35 @@ class AuthController extends Controller
                 ], 403);
             }
 
+            $institution = PlatformInstitutionHelper::resolveForStudent($student);
+            if ($institution && !PlatformInstitutionHelper::canLoginInstitution($institution)) {
+                return response()->json([
+                    'message' => 'Your institution account is not active. Please contact your institution administrator.',
+                ], 403);
+            }
+
             return response()->json([
                 'message' => 'Login successful',
                 'role' => 'learner',
                 'user' => $student,
+                'institution' => PlatformInstitutionHelper::institutionPayload($institution),
+                'is_main_admin' => false,
             ]);
         }
 
-        // Users table (admin, staff, instructors, etc.)
-        $user = User::where('email', $username)->orWhere('name', $username)->first();
-        if ($user && $verify($user)) {
+        // Users table (admin, staff, instructors, partners, etc.)
+        try {
+            $user = User::query()
+                ->whereRaw('LOWER(TRIM(email)) = ?', [$username])
+                ->orWhere('name', $username)
+                ->first();
+        } catch (QueryException $e) {
+            return response()->json([
+                'message' => 'Database schema error. Run: php artisan schema:rebuild-corrupted --seed --force',
+            ], 503);
+        }
+
+        if ($user && PlatformUserService::verifyPassword($user, $password)) {
             $userStatus = strtolower(trim((string) ($user->status ?? 'active')));
             $userRole = strtolower(trim((string) ($user->role ?? 'admin')));
 
@@ -220,10 +263,36 @@ class AuthController extends Controller
                 ], 403);
             }
 
+            $institution = PlatformInstitutionHelper::resolveForUser($user);
+            if ($userRole === 'partner_company') {
+                if (!$institution) {
+                    return response()->json(['message' => 'Partner institution not linked to this account.'], 403);
+                }
+                if ($institution->status === 'disabled') {
+                    return response()->json(['message' => 'Your institution has been disabled. Contact platform support.'], 403);
+                }
+                if ($institution->status === 'pending_approval') {
+                    return response()->json([
+                        'message' => 'Your institution registration is pending main admin approval.',
+                    ], 403);
+                }
+                if (PlatformInstitutionHelper::shouldBlockLoginForPayment($user, $institution)) {
+                    return response()->json([
+                        'message' => 'Your institution account has an outstanding payment. Check your email for the Stripe payment link.',
+                    ], 403);
+                }
+            } elseif ($institution && !PlatformInstitutionHelper::canLoginInstitution($institution)) {
+                return response()->json([
+                    'message' => 'Your institution account is not active. Please contact support.',
+                ], 403);
+            }
+
             return response()->json([
                 'message' => 'Login successful',
                 'role' => $user->role ?? 'admin',
                 'user' => $user,
+                'institution' => PlatformInstitutionHelper::institutionPayload($institution),
+                'is_main_admin' => PlatformInstitutionHelper::isMainPlatformAdmin($user),
             ]);
         }
 

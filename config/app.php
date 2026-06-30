@@ -68,7 +68,19 @@ return [
     |--------------------------------------------------------------------------
     */
 
-    'auto_migrate' => (bool) env('AUTO_MIGRATE', env('APP_ENV') === 'local'),
+    'auto_migrate' => (bool) env('AUTO_MIGRATE', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Auto Seed Demo Data
+    |--------------------------------------------------------------------------
+    |
+    | When true, seeds LearningHubDemoSeeder after migrations if no instructors
+    | exist (safe to run on every deploy — seeder uses updateOrCreate).
+    |
+    */
+
+    'auto_seed_demo' => (bool) env('AUTO_SEED_DEMO', true),
 
     /*
     |--------------------------------------------------------------------------

@@ -4,8 +4,11 @@ namespace App\Services;
 
 use App\Models\CourseMaterial;
 use App\Models\LiveZoomCohort;
+use App\Models\WebinarSetting;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Http\Client\Response;
 
 class ZoomService
 {
@@ -50,6 +53,186 @@ class ZoomService
         Cache::forget('zoom_access_token_v2');
     }
 
+    public function invalidateHostUserCache(): void
+    {
+        Cache::forget($this->hostUserCacheKey());
+        Cache::forget('zoom_resolved_host_user_id_v1');
+        Cache::forget($this->userProfilePictureCacheKey());
+        Cache::forget($this->configuredHostBrandingCacheKey());
+    }
+
+    protected function userProfilePictureCacheKey(?string $emailOrId = null): string
+    {
+        $key = strtolower(trim($emailOrId ?? $this->hostUserId()));
+
+        return 'zoom_user_pic_url_v1_' . md5($key !== '' ? $key : '__default__');
+    }
+
+    protected function configuredHostBrandingCacheKey(): string
+    {
+        return 'zoom_host_brand_profile_v2_' . md5(strtolower(trim($this->hostUserId())));
+    }
+
+    /**
+     * Prefer Zoom legal name (first + last) over short display_name.
+     *
+     * @param  array<string, mixed>|null  $profile
+     */
+    public function resolveZoomProfileFullName(?array $profile): string
+    {
+        if (!is_array($profile)) {
+            return '';
+        }
+
+        $first = trim((string) ($profile['first_name'] ?? ''));
+        $last = trim((string) ($profile['last_name'] ?? ''));
+        $full = trim($first . ' ' . $last);
+        if ($full !== '') {
+            return $full;
+        }
+
+        return trim((string) ($profile['display_name'] ?? ''));
+    }
+
+    /**
+     * Branding for the Zoom meeting host from ZOOM_HOST_USER_ID (.env) — not the CMS login user.
+     *
+     * @return array{name: string, email: string|null, avatar_url: string|null}
+     */
+    public function resolveConfiguredHostBranding(): array
+    {
+        return Cache::remember($this->configuredHostBrandingCacheKey(), 3600, function () {
+            $configured = trim($this->hostUserId());
+            $profile = $this->fetchConfiguredZoomHostProfile();
+
+            $name = '';
+            $email = null;
+            $avatarUrl = null;
+
+            if (is_array($profile)) {
+                $name = $this->resolveZoomProfileFullName($profile);
+                $email = isset($profile['email']) ? trim((string) $profile['email']) : null;
+                if ($email === '') {
+                    $email = null;
+                }
+                $pic = trim((string) ($profile['pic_url'] ?? ''));
+                if ($pic !== '' && preg_match('#^https?://#i', $pic)) {
+                    $avatarUrl = $pic;
+                }
+            }
+
+            if ($email === null && str_contains($configured, '@')) {
+                $email = $configured;
+            }
+
+            return [
+                'name' => $name !== '' ? $name : (string) config('app.name', 'Xander Learning Hub'),
+                'email' => $email,
+                'avatar_url' => $avatarUrl,
+            ];
+        });
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    protected function fetchConfiguredZoomHostProfile(): ?array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return null;
+        }
+
+        $configured = trim($this->hostUserId());
+        if ($configured === '' || $configured === 'me') {
+            return null;
+        }
+
+        $candidates = [$configured];
+        if (str_contains($configured, '@')) {
+            $candidates[] = strtolower($configured);
+        }
+
+        foreach (array_values(array_unique($candidates)) as $candidate) {
+            $response = $client->get('/users/' . rawurlencode($candidate));
+            if ($response->successful()) {
+                return $response->json();
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function getUserProfile(?string $userIdOrEmail = null): ?array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return null;
+        }
+
+        $candidates = array_values(array_unique(array_filter([
+            $userIdOrEmail ? trim($userIdOrEmail) : null,
+            trim($this->hostUserId()),
+        ])));
+
+        foreach ($candidates as $candidate) {
+            if ($candidate === '' || $candidate === 'me') {
+                continue;
+            }
+
+            $response = $client->get('/users/' . rawurlencode($candidate));
+            if ($response->successful()) {
+                return $response->json();
+            }
+        }
+
+        $response = $client->get('/users/me');
+        if ($response->successful()) {
+            return $response->json();
+        }
+
+        $resolvedHost = $this->resolveHostUserId();
+        if ($resolvedHost !== '' && $resolvedHost !== 'me') {
+            $response = $client->get('/users/' . rawurlencode($resolvedHost));
+            if ($response->successful()) {
+                return $response->json();
+            }
+        }
+
+        return null;
+    }
+
+    public function resolveUserProfilePicture(?string $emailOrId = null): ?string
+    {
+        if ($emailOrId === null || trim($emailOrId) === '') {
+            return $this->resolveConfiguredHostBranding()['avatar_url'];
+        }
+
+        $cacheKey = $this->userProfilePictureCacheKey($emailOrId);
+
+        return Cache::remember($cacheKey, 3600, function () use ($emailOrId) {
+            $profile = $this->getUserProfile($emailOrId);
+            if (!is_array($profile)) {
+                return null;
+            }
+
+            $picUrl = trim((string) ($profile['pic_url'] ?? ''));
+            if ($picUrl === '' || !preg_match('#^https?://#i', $picUrl)) {
+                return null;
+            }
+
+            return $picUrl;
+        });
+    }
+
+    protected function hostUserCacheKey(): string
+    {
+        return 'zoom_resolved_host_user_id_v2_' . md5(trim($this->hostUserId()));
+    }
+
     protected function client()
     {
         $token = $this->getAccessToken();
@@ -60,6 +243,27 @@ class ZoomService
         return Http::withToken($token)
             ->timeout(20)
             ->baseUrl('https://api.zoom.us/v2');
+    }
+
+    /**
+     * @param  array<string, mixed>  $query
+     */
+    protected function safeGet(mixed $client, string $path, array $query = []): ?Response
+    {
+        if (!$client) {
+            return null;
+        }
+
+        try {
+            return $client->get($path, $query);
+        } catch (\Throwable $e) {
+            Log::warning('Zoom API request failed', [
+                'path' => $path,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
     }
 
     public function listMeetings(string $userId = 'me'): ?array
@@ -105,7 +309,15 @@ class ZoomService
                     $params['next_page_token'] = $nextPageToken;
                 }
 
-                $response = $client->get("/users/{$encodedUser}/recordings", $params);
+                $response = $this->safeGet($client, "/users/{$encodedUser}/recordings", $params);
+
+                if ($response === null) {
+                    return [
+                        'error' => true,
+                        'status' => 0,
+                        'body' => ['message' => 'Zoom API unreachable'],
+                    ];
+                }
 
                 if ($response->failed()) {
                     return [
@@ -168,7 +380,15 @@ class ZoomService
             return null;
         }
 
-        $response = $client->get("/meetings/{$encoded}/recordings");
+        $response = $this->safeGet($client, "/meetings/{$encoded}/recordings");
+
+        if ($response === null) {
+            return [
+                'error' => true,
+                'status' => 0,
+                'body' => ['message' => 'Zoom API unreachable'],
+            ];
+        }
 
         if ($response->status() === 404) {
             return null;
@@ -218,7 +438,15 @@ class ZoomService
                     $params['next_page_token'] = $nextPageToken;
                 }
 
-                $response = $client->get("/accounts/{$encodedAccount}/recordings", $params);
+                $response = $this->safeGet($client, "/accounts/{$encodedAccount}/recordings", $params);
+
+                if ($response === null) {
+                    return [
+                        'error' => true,
+                        'status' => 0,
+                        'body' => ['message' => 'Zoom API unreachable'],
+                    ];
+                }
 
                 if ($response->failed()) {
                     return [
@@ -399,36 +627,115 @@ class ZoomService
     public function resolveHostUserId(): string
     {
         $configured = trim($this->hostUserId());
-        if ($configured !== '' && $configured !== 'me' && !str_contains($configured, '@')) {
-            return $configured;
+        $cacheKey = $this->hostUserCacheKey();
+
+        $cached = Cache::get($cacheKey);
+        if (is_string($cached) && $cached !== '' && $this->zoomHostUserExists($cached)) {
+            return $cached;
         }
 
-        return Cache::remember('zoom_resolved_host_user_id_v1', 3600, function () use ($configured) {
-            $client = $this->client();
-            if (!$client) {
-                return $configured !== '' ? $configured : 'me';
-            }
+        if (is_string($cached) && $cached !== '') {
+            Cache::forget($cacheKey);
+        }
 
-            if ($configured !== '' && str_contains($configured, '@')) {
-                $response = $client->get('/users/' . rawurlencode($configured));
-                if ($response->successful()) {
-                    $id = $response->json('id');
-                    if (is_string($id) && $id !== '') {
-                        return $id;
-                    }
-                }
-            }
+        $resolved = $this->resolveHostUserIdFresh($configured);
+        Cache::put($cacheKey, $resolved, 3600);
 
-            $response = $client->get('/users/me');
+        return $resolved;
+    }
+
+    protected function resolveHostUserIdFresh(string $configured): string
+    {
+        $client = $this->client();
+        if (!$client) {
+            return $configured !== '' ? $configured : 'me';
+        }
+
+        if ($configured !== '' && $configured !== 'me' && !str_contains($configured, '@')) {
+            if ($this->zoomHostUserExists($configured)) {
+                return $configured;
+            }
+        }
+
+        if ($configured !== '' && str_contains($configured, '@')) {
+            $response = $client->get('/users/' . rawurlencode($configured));
             if ($response->successful()) {
                 $id = $response->json('id');
                 if (is_string($id) && $id !== '') {
                     return $id;
                 }
             }
+        }
 
-            return $configured !== '' ? $configured : 'me';
-        });
+        $response = $client->get('/users/me');
+        if ($response->successful()) {
+            $id = $response->json('id');
+            if (is_string($id) && $id !== '') {
+                return $id;
+            }
+        }
+
+        return $configured !== '' ? $configured : 'me';
+    }
+
+    protected function zoomHostUserExists(string $userId): bool
+    {
+        if ($userId === '' || $userId === 'me') {
+            return true;
+        }
+
+        $client = $this->client();
+        if (!$client) {
+            return false;
+        }
+
+        return $client->get('/users/' . rawurlencode($userId))->successful();
+    }
+
+    protected function isZoomUserNotFoundMessage(?string $message): bool
+    {
+        if (!is_string($message) || $message === '') {
+            return false;
+        }
+
+        return stripos($message, 'user does not exist') !== false
+            || stripos($message, 'user not found') !== false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @return array<string, mixed>|null
+     */
+    protected function createMeetingForHost(array $payload, ?string $userId = null): ?array
+    {
+        $client = $this->client();
+        if (!$client) {
+            return null;
+        }
+
+        $host = $userId ?: $this->resolveHostUserId();
+        $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
+
+        if ($response->failed()) {
+            $body = $response->json();
+            $message = is_array($body) ? ($body['message'] ?? '') : '';
+
+            if ($this->isZoomUserNotFoundMessage($message)) {
+                $this->invalidateHostUserCache();
+                $host = $this->resolveHostUserId();
+                $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
+            }
+        }
+
+        if ($response->failed()) {
+            return [
+                'error' => true,
+                'status' => $response->status(),
+                'body' => $response->json(),
+            ];
+        }
+
+        return $response->json();
     }
 
     public function isConfigured(): bool
@@ -712,13 +1019,6 @@ class ZoomService
      */
     public function createPersistentCohortMeeting(array $data, ?string $userId = null): ?array
     {
-        $client = $this->client();
-        if (!$client) {
-            return null;
-        }
-
-        $host = $userId ?: $this->resolveHostUserId();
-
         $payload = [
             'topic' => $data['topic'] ?? 'Live session',
             'type' => 3,
@@ -738,17 +1038,7 @@ class ZoomService
             ],
         ];
 
-        $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
-
-        if ($response->failed()) {
-            return [
-                'error' => true,
-                'status' => $response->status(),
-                'body' => $response->json(),
-            ];
-        }
-
-        return $response->json();
+        return $this->createMeetingForHost($payload, $userId);
     }
 
     /**
@@ -756,13 +1046,6 @@ class ZoomService
      */
     public function createInstantMeeting(array $data, ?string $userId = null): ?array
     {
-        $client = $this->client();
-        if (!$client) {
-            return null;
-        }
-
-        $host = $userId ?: $this->resolveHostUserId();
-
         $payload = [
             'topic' => $data['topic'] ?? 'Live session',
             'type' => 1,
@@ -779,17 +1062,7 @@ class ZoomService
             ],
         ];
 
-        $response = $client->post('/users/' . rawurlencode($host) . '/meetings', $payload);
-
-        if ($response->failed()) {
-            return [
-                'error' => true,
-                'status' => $response->status(),
-                'body' => $response->json(),
-            ];
-        }
-
-        return $response->json();
+        return $this->createMeetingForHost($payload, $userId);
     }
 
     public function createMeeting(array $data, string $userId = 'me'): ?array
@@ -910,30 +1183,39 @@ class ZoomService
         $hostId = $userId === 'me' ? $this->resolveHostUserId() : $userId;
         $cacheKey = 'zoom_live_meeting_ids_' . $hostId;
 
-        return Cache::remember($cacheKey, 20, function () use ($hostId) {
-            $client = $this->client();
-            if (!$client) {
-                return [];
-            }
+        try {
+            return Cache::remember($cacheKey, 20, function () use ($hostId) {
+                $client = $this->client();
+                if (!$client) {
+                    return [];
+                }
 
-            $response = $client->get('/users/' . rawurlencode($hostId) . '/meetings', [
-                'type' => 'live',
-                'page_size' => 100,
+                $response = $this->safeGet($client, '/users/' . rawurlencode($hostId) . '/meetings', [
+                    'type' => 'live',
+                    'page_size' => 100,
+                ]);
+
+                if (!$response || $response->failed()) {
+                    return [];
+                }
+
+                $meetings = $response->json('meetings') ?? [];
+
+                return collect($meetings)
+                    ->pluck('id')
+                    ->filter()
+                    ->map(fn ($id) => (string) $id)
+                    ->values()
+                    ->all();
+            });
+        } catch (\Throwable $e) {
+            Log::warning('Zoom live meetings lookup failed', [
+                'host' => $hostId,
+                'error' => $e->getMessage(),
             ]);
 
-            if ($response->failed()) {
-                return [];
-            }
-
-            $meetings = $response->json('meetings') ?? [];
-
-            return collect($meetings)
-                ->pluck('id')
-                ->filter()
-                ->map(fn ($id) => (string) $id)
-                ->values()
-                ->all();
-        });
+            return [];
+        }
     }
 
     public function isMeetingLive(string $meetingId, string $userId = 'me'): bool
@@ -1180,6 +1462,48 @@ class ZoomService
         return array_values(array_unique($candidates, SORT_STRING));
     }
 
+    /**
+     * Password variants for Meeting Registration webinar (Meeting SDK join).
+     *
+     * @return list<string>
+     */
+    public function resolveWebinarJoinPasswordCandidates(WebinarSetting $settings, ?array $meetingDetails = null): array
+    {
+        $candidates = [];
+
+        $stored = trim((string) ($settings->zoom_password ?? ''));
+        if ($stored !== '') {
+            $candidates[] = $stored;
+        }
+
+        if (is_array($meetingDetails) && empty($meetingDetails['error'])) {
+            foreach (['password', 'passcode', 'h323_password', 'encrypted_password'] as $key) {
+                $value = $meetingDetails[$key] ?? null;
+                if (is_string($value) && trim($value) !== '') {
+                    $candidates[] = trim($value);
+                }
+            }
+        }
+
+        foreach ([$settings->zoom_join_url ?? null, $settings->zoom_start_url ?? null] as $url) {
+            $fromUrl = $this->extractPasswordFromJoinUrl(is_string($url) ? $url : null);
+            if ($fromUrl) {
+                $candidates[] = $fromUrl;
+            }
+        }
+
+        $candidates[] = '';
+
+        return array_values(array_unique($candidates, SORT_STRING));
+    }
+
+    public function resolveWebinarMeetingPassword(WebinarSetting $settings, ?array $meetingDetails = null): string
+    {
+        $candidates = $this->resolveWebinarJoinPasswordCandidates($settings, $meetingDetails);
+
+        return $candidates[0] ?? '';
+    }
+
     public function resolveMaterialMeetingPassword(CourseMaterial $material, ?array $meetingDetails = null): string
     {
         $candidates = $this->resolveMaterialJoinPasswordCandidates($material, $meetingDetails);
@@ -1364,7 +1688,16 @@ class ZoomService
             return $cached;
         }
 
-        $collected = $this->collectAllCloudRecordings($ids, $monthsBack, true);
+        try {
+            $collected = $this->collectAllCloudRecordings($ids, $monthsBack, true);
+        } catch (\Throwable $e) {
+            Log::warning('Zoom cloud recordings lookup failed', ['error' => $e->getMessage()]);
+            $collected = [
+                'meetings' => [],
+                'errors' => [$e->getMessage()],
+                'strategies' => [],
+            ];
+        }
         $collected['cached'] = false;
         Cache::put($cacheKey, $collected, now()->addMinutes(5));
 

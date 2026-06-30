@@ -6,6 +6,7 @@ use App\Models\CourseEnrollment;
 use App\Models\CourseMaterial;
 use App\Models\WebinarSetting;
 use App\Services\ZoomService;
+use App\Support\EnrollmentStatusHelper;
 
 class LearnerRecordingAccess
 {
@@ -48,8 +49,18 @@ class LearnerRecordingAccess
         return CourseEnrollment::query()
             ->where('student_id', $studentId)
             ->where('course_id', $courseId)
-            ->whereIn('status', ['paid', 'completed'])
+            ->whereIn('status', EnrollmentStatusHelper::PAID_STATUSES)
             ->exists();
+    }
+
+    public static function hasCourseAccess(int $studentId, int $courseId): bool
+    {
+        $enrollment = CourseEnrollment::query()
+            ->where('student_id', $studentId)
+            ->where('course_id', $courseId)
+            ->first();
+
+        return $enrollment && EnrollmentStatusHelper::hasCourseAccess($enrollment->status);
     }
 
     /**
@@ -61,7 +72,7 @@ class LearnerRecordingAccess
     {
         $courseIds = CourseEnrollment::query()
             ->where('student_id', $studentId)
-            ->whereIn('status', ['paid', 'completed'])
+            ->whereIn('status', EnrollmentStatusHelper::accessStatuses())
             ->when($courseId, fn ($q) => $q->where('course_id', $courseId))
             ->pluck('course_id');
 

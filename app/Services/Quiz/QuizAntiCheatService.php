@@ -11,12 +11,18 @@ class QuizAntiCheatService
     public function prepareDelivery(array $meta, int $studentId): array
     {
         $settings = is_array($meta['anti_cheat'] ?? null) ? $meta['anti_cheat'] : [];
-        $pool = $meta['question_pool'] ?? ($meta['questions'] ?? []);
-        if (!is_array($pool)) {
-            $pool = [];
+        $deliverCount = (int) ($settings['deliver_count'] ?? 0);
+        $questions = is_array($meta['questions'] ?? null) ? $meta['questions'] : [];
+        $poolMeta = is_array($meta['question_pool'] ?? null) ? $meta['question_pool'] : [];
+
+        // Use question_pool only when subset delivery is configured; otherwise always use questions
+        // (stale question_pool copies were missing oral prompt_audio_url after edits).
+        if ($deliverCount > 0 && $poolMeta !== []) {
+            $pool = $this->mergeQuestionPoolWithCanonical($poolMeta, $questions);
+        } else {
+            $pool = $questions;
         }
 
-        $deliverCount = (int) ($settings['deliver_count'] ?? 0);
         if ($deliverCount > 0 && count($pool) > $deliverCount) {
             $pool = $this->deterministicSample($pool, $deliverCount, $studentId, (int) ($meta['source_material_id'] ?? 0));
         }
@@ -30,7 +36,7 @@ class QuizAntiCheatService
             if (!is_array($question)) {
                 continue;
             }
-            $prepared[] = $this->maybeShuffleOptions($question, $settings, $studentId);
+            $prepared[] = $this->prepareOptionsOrder($question);
         }
 
         $ids = array_values(array_map(fn ($q) => (string) ($q['id'] ?? ''), $prepared));
@@ -50,17 +56,12 @@ class QuizAntiCheatService
     }
 
     /**
-     * @param  array<string, mixed>  $settings
      * @param  array<string, mixed>  $question
      * @return array<string, mixed>
      */
-    protected function maybeShuffleOptions(array $question, array $settings, int $studentId): array
+    protected function prepareOptionsOrder(array $question): array
     {
         $type = (string) ($question['type'] ?? '');
-        if (!($settings['shuffle_options'] ?? true)) {
-            return $question;
-        }
-
         if (!in_array($type, ['multiple_choice', 'multiple_response'], true)) {
             return $question;
         }
@@ -70,7 +71,7 @@ class QuizAntiCheatService
             return $question;
         }
 
-        $question['options'] = $this->deterministicShuffle($options, $studentId, (string) ($question['id'] ?? 'opts'));
+        $question['options'] = QuizOptionSorter::sort($options);
 
         return $question;
     }
@@ -108,5 +109,45 @@ class QuizAntiCheatService
         });
 
         return array_slice($items, 0, $count);
+    }
+
+    /**
+     * Merge canonical question fields (e.g. oral audio) into pool copies by id.
+     *
+     * @param  array<int, array<string, mixed>>  $pool
+     * @param  array<int, array<string, mixed>>  $canonical
+     * @return array<int, array<string, mixed>>
+     */
+    protected function mergeQuestionPoolWithCanonical(array $pool, array $canonical): array
+    {
+        $byId = [];
+        foreach ($canonical as $q) {
+            if (!is_array($q)) {
+                continue;
+            }
+            $id = (string) ($q['id'] ?? '');
+            if ($id !== '') {
+                $byId[$id] = $q;
+            }
+        }
+
+        return array_values(array_map(function ($q) use ($byId) {
+            if (!is_array($q)) {
+                return $q;
+            }
+            $id = (string) ($q['id'] ?? '');
+            if ($id === '' || !isset($byId[$id])) {
+                return $q;
+            }
+
+            return array_merge($q, array_filter([
+                'prompt_audio_url' => $byId[$id]['prompt_audio_url'] ?? null,
+                'prompt_audio_filename' => $byId[$id]['prompt_audio_filename'] ?? null,
+                'instruction' => $byId[$id]['instruction'] ?? null,
+                'response_format' => $byId[$id]['response_format'] ?? null,
+                'question' => $byId[$id]['question'] ?? null,
+                'points' => $byId[$id]['points'] ?? null,
+            ], fn ($v) => $v !== null && $v !== ''));
+        }, $pool));
     }
 }

@@ -3,6 +3,7 @@
 namespace Database\Seeders;
 
 use App\Models\User;
+use App\Support\PlatformUserService;
 use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
 
@@ -15,36 +16,64 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        User::updateOrCreate(
-            ['email' => 'admin@parrot.com'],
-            [
-                'name' => 'Admin User',
-                'password' => bcrypt('1234'),
-                'role' => 'admin',
-            ]
+        $plainPassword = PlatformUserService::seedPassword();
+
+        PlatformUserService::dedupeDuplicateEmails();
+        PlatformUserService::deleteLegacyEmails();
+
+        self::seedPlatformUser(
+            'infos@parrotglobalstudyacademy.ca',
+            'Parrot Canada Visa Consultant',
+            'admin',
+            $plainPassword
         );
 
-        User::updateOrCreate(
-            ['email' => 'instructor@parrot.com'],
-            [
-                'name' => 'Instructor User',
-                'password' => bcrypt('1234'),
-                'role' => 'instructor',
-            ]
+        self::seedPlatformUser(
+            'instructor@parrotglobalstudyacademy.ca',
+            'Instructor User',
+            'instructor',
+            $plainPassword
         );
 
-        User::updateOrCreate(
-            ['email' => 'staff@parrot.com'],
-            [
-                'name' => 'Staff User',
-                'password' => bcrypt('1234'),
-                'role' => 'staff',
-            ]
+        self::seedPlatformUser(
+            'staff@parrotglobalstudyacademy.ca',
+            'Staff User',
+            'staff',
+            $plainPassword
         );
 
-        // Seed learners into students table instead of users table
         $this->call([
-            StudentSeeder::class,
+            AvailableScheduleSeeder::class,
+            LearningHubDemoSeeder::class,
+            PlatformInstitutionSeeder::class,
         ]);
+    }
+
+    private static function seedPlatformUser(
+        string $email,
+        string $name,
+        string $role,
+        string $plainPassword
+    ): void {
+        $user = User::query()->whereRaw('LOWER(TRIM(email)) = ?', [strtolower(trim($email))])->first();
+
+        if (!$user) {
+            User::create([
+                'email' => $email,
+                'name' => $name,
+                'password' => $plainPassword,
+                'role' => $role,
+                'status' => 'Active',
+            ]);
+
+            return;
+        }
+
+        $user->fill([
+            'name' => $name,
+            'role' => $role,
+            'status' => 'Active',
+        ]);
+        $user->save();
     }
 }

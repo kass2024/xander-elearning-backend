@@ -14,8 +14,15 @@ use Smalot\PdfParser\Parser as PdfParser;
 
 class MaterialDocumentReader
 {
+    protected ?string $lastFetchError = null;
+
     public function __construct(protected PCloudService $pcloud)
     {
+    }
+
+    public function lastFetchError(): ?string
+    {
+        return $this->lastFetchError;
     }
 
     /**
@@ -60,7 +67,7 @@ class MaterialDocumentReader
 
         $cacheKey = 'quiz_mat_text:' . $material->id . ':' . $this->materialCacheVersion($material);
 
-        return Cache::remember($cacheKey, $ttl, fn () => $this->readMaterialTextUncached($material));
+        return $this->rememberCacheValue($cacheKey, $ttl, fn () => $this->readMaterialTextUncached($material));
     }
 
     protected function readMaterialTextUncached(CourseMaterial $material): ?string
@@ -107,13 +114,58 @@ class MaterialDocumentReader
             return $this->fetchBytesUncached($material);
         }
 
-        $cacheKey = 'quiz_mat_bytes:' . $material->id . ':' . $this->materialCacheVersion($material);
+        $cacheKey = 'quiz_mat_bytes_b64:' . $material->id . ':' . $this->materialCacheVersion($material);
 
-        return Cache::remember($cacheKey, $ttl, fn () => $this->fetchBytesUncached($material));
+        $encoded = $this->rememberCacheValue($cacheKey, $ttl, function () use ($material) {
+            $bytes = $this->fetchBytesUncached($material);
+
+            return is_string($bytes) && $bytes !== '' ? base64_encode($bytes) : null;
+        });
+
+        if (!is_string($encoded) || $encoded === '') {
+            return null;
+        }
+
+        $decoded = base64_decode($encoded, true);
+
+        return is_string($decoded) && $decoded !== '' ? $decoded : null;
+    }
+
+    /**
+     * Cache helper — never let cache write failures break PDF reads (binary data breaks DB cache).
+     *
+     * @template T
+     * @param  callable(): (T|null)  $callback
+     * @return T|null
+     */
+    protected function rememberCacheValue(string $cacheKey, int $ttl, callable $callback): mixed
+    {
+        try {
+            if (Cache::has($cacheKey)) {
+                return Cache::get($cacheKey);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Material cache read failed', ['key' => $cacheKey, 'error' => $e->getMessage()]);
+        }
+
+        $value = $callback();
+
+        if ($value === null) {
+            return null;
+        }
+
+        try {
+            Cache::put($cacheKey, $value, $ttl);
+        } catch (\Throwable $e) {
+            Log::warning('Material cache write failed', ['key' => $cacheKey, 'error' => $e->getMessage()]);
+        }
+
+        return $value;
     }
 
     protected function fetchBytesUncached(CourseMaterial $material): ?string
     {
+        $this->lastFetchError = null;
         $meta = QuizMaterialHelper::meta($material);
         $fileId = MaterialFileHelper::pcloudFileId($meta);
 
@@ -125,10 +177,15 @@ class MaterialDocumentReader
                     return $response->body();
                 }
 
+                $this->lastFetchError = 'pCloud download failed (HTTP ' . $response->status() . ') for file #' . $fileId;
                 Log::warning('Material download failed', [
                     'material_id' => $material->id,
                     'status' => $response->status(),
                 ]);
+            } elseif ($fileId && !$this->pcloud->isConfigured()) {
+                $this->lastFetchError = 'pCloud is not configured on the server (PCLOUD_ACCESS_TOKEN missing).';
+            } elseif (!$fileId) {
+                $this->lastFetchError = 'Material has no pCloud file attached. Re-upload the PDF to course materials.';
             }
 
             $resourceUrl = trim((string) ($material->resource_url ?? ''));
@@ -137,8 +194,12 @@ class MaterialDocumentReader
                 if ($response->successful()) {
                     return $response->body();
                 }
+
+                $this->lastFetchError = ($this->lastFetchError ? $this->lastFetchError . ' ' : '')
+                    . 'Direct URL download failed (HTTP ' . $response->status() . ').';
             }
         } catch (\Throwable $e) {
+            $this->lastFetchError = $e->getMessage();
             Log::warning('Material fetch failed', [
                 'material_id' => $material->id,
                 'error' => $e->getMessage(),
@@ -398,7 +459,7 @@ class MaterialDocumentReader
         return $text !== '' ? $text : null;
     }
 
-    protected function transcribeMediaBytes(string $bytes, string $filename): ?string
+    public function transcribeMediaBytes(string $bytes, string $filename): ?string
     {
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
         $audioVideo = ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'mp4', 'mov', 'webm', 'mkv'];

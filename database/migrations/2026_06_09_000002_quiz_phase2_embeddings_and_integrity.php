@@ -26,14 +26,20 @@ return new class extends Migration
 
         if (Schema::hasTable('quiz_attempts')) {
             foreach ([
-                'tab_switch_count' => fn (Blueprint $table) => $table->unsignedSmallInteger('tab_switch_count')->default(0)->after('marking_provider'),
-                'focus_lost_seconds' => fn (Blueprint $table) => $table->unsignedInteger('focus_lost_seconds')->default(0)->after('marking_provider'),
-                'integrity_flags' => fn (Blueprint $table) => $table->json('integrity_flags')->nullable()->after('marking_provider'),
-                'delivered_question_ids' => fn (Blueprint $table) => $table->json('delivered_question_ids')->nullable()->after('marking_provider'),
+                'tab_switch_count' => fn (Blueprint $table) => $table->unsignedSmallInteger('tab_switch_count')->default(0),
+                'focus_lost_seconds' => fn (Blueprint $table) => $table->unsignedInteger('focus_lost_seconds')->default(0),
+                'integrity_flags' => fn (Blueprint $table) => $table->json('integrity_flags')->nullable(),
+                'delivered_question_ids' => fn (Blueprint $table) => $table->json('delivered_question_ids')->nullable(),
             ] as $column => $add) {
                 if (!$this->columnExists('quiz_attempts', $column)) {
                     Schema::table('quiz_attempts', $add);
                 }
+            }
+
+            if (!$this->columnExists('quiz_attempts', 'marking_provider')) {
+                Schema::table('quiz_attempts', function (Blueprint $table) {
+                    $table->string('marking_provider')->nullable();
+                });
             }
         }
     }

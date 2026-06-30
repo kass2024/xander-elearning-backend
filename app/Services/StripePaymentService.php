@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Course;
 use App\Models\CourseEnrollment;
 use App\Models\CoursePayment;
+use App\Support\EnrollmentStatusHelper;
 use App\Support\FrontendUrl;
 use Stripe\Checkout\Session as StripeCheckoutSession;
 use Stripe\PaymentIntent;
@@ -70,11 +71,11 @@ class StripePaymentService
             ];
         }
 
-        if ($enrollment->status !== 'approved') {
+        if (!EnrollmentStatusHelper::canPay($enrollment->status)) {
             return [
                 'ok' => false,
                 'status' => 422,
-                'message' => 'Your enrollment is pending administrator approval. An admin must approve your application in Student Management before you can pay.',
+                'message' => 'Payment is only available for approved enrollments that have not been paid yet.',
             ];
         }
 
@@ -176,7 +177,7 @@ class StripePaymentService
 
         return [
             'ok' => true,
-            'message' => 'Payment confirmed. Your course access is now active.',
+            'message' => 'Payment confirmed. Thank you for your payment.',
         ];
     }
 

@@ -25,6 +25,8 @@ use App\Http\Controllers\Api\CertificateController;
 use App\Services\ZoomService;
 
 use App\Support\CourseMaterialHelper;
+use App\Support\EnrollmentStatusHelper;
+use App\Support\QuizMaterialHelper;
 use App\Support\LearnerRecordingAccess;
 
 use Carbon\Carbon;
@@ -73,13 +75,25 @@ class LearnerDashboardController extends Controller
 
         $enrollments = CourseEnrollment::query()
 
-            ->with(['course.materials'])
+            ->with(['course.materials', 'studyShifts'])
 
             ->where('student_id', $student->id)
 
             ->orderByDesc('updated_at')
 
             ->get();
+
+        $shiftService = app(\App\Services\EnrollmentStudyShiftService::class);
+
+        $pendingShiftRequests = \App\Models\StudyShiftChangeRequest::query()
+
+            ->where('student_id', $student->id)
+
+            ->where('status', 'pending')
+
+            ->get()
+
+            ->keyBy('course_id');
 
 
 
@@ -88,14 +102,15 @@ class LearnerDashboardController extends Controller
 
 
         $paidOrCompleted = $enrollments->filter(
-
-            fn (CourseEnrollment $e) => in_array(strtolower((string) $e->status), ['paid', 'completed'], true)
-
+            fn (CourseEnrollment $e) => EnrollmentStatusHelper::isPaid($e->status)
         );
 
-
+        $accessibleEnrollments = $enrollments->filter(
+            fn (CourseEnrollment $e) => EnrollmentStatusHelper::hasCourseAccess($e->status)
+        );
 
         $paidCourseIds = $paidOrCompleted->pluck('course_id')->filter()->unique()->values();
+        $accessibleCourseIds = $accessibleEnrollments->pluck('course_id')->filter()->unique()->values();
 
 
 
@@ -139,7 +154,7 @@ class LearnerDashboardController extends Controller
 
 
 
-        $enrolledCourses = $enrollments->map(function (CourseEnrollment $enrollment) {
+        $enrolledCourses = $enrollments->map(function (CourseEnrollment $enrollment) use ($shiftService, $pendingShiftRequests) {
 
             $course = $enrollment->course;
 
@@ -164,15 +179,11 @@ class LearnerDashboardController extends Controller
             $status = strtolower((string) ($enrollment->status ?? 'enrolled'));
 
             $progress = match ($status) {
-
                 'completed' => 100,
-
-                'paid' => 55,
-
+                'paid' => 75,
+                'approved' => 40,
                 'enrolled' => 15,
-
                 default => 5,
-
             };
 
 
@@ -181,11 +192,15 @@ class LearnerDashboardController extends Controller
 
                 'id' => $course->id,
 
+                'enrollment_id' => $enrollment->id,
+
                 'title' => $course->title,
 
                 'description' => $course->description,
 
                 'status' => $enrollment->status,
+                'payment_paid' => EnrollmentStatusHelper::isPaid($status),
+                'has_access' => EnrollmentStatusHelper::hasCourseAccess($status),
 
                 'level' => $enrollment->level,
 
@@ -203,17 +218,32 @@ class LearnerDashboardController extends Controller
 
                 'enrolled_at' => $enrollment->created_at?->toIso8601String(),
 
+                'study_shifts' => $shiftService->formatStudyShiftsForApi($enrollment->studyShifts),
+
+                'shift_change_request' => $this->serializeLearnerShiftRequest(
+                    $pendingShiftRequests->get($course->id),
+                    $shiftService
+                ),
+
+                'course_code' => $course->course_code,
+                'general_information' => $course->general_information,
+                'important_information' => $course->important_information,
+                'guidelines' => $course->guidelines ?? [],
+                'how_to_use' => $course->how_to_use ?? [],
+                'attendance_policy' => $course->attendance_policy,
+                'assessment_policy' => $course->assessment_policy,
+                'requirements' => $course->requirements,
+                'duration' => $course->duration,
+
             ];
 
         })->filter()->values();
 
 
 
-        $allMaterials = $paidCourseIds->isEmpty()
-
+        $allMaterials = $accessibleCourseIds->isEmpty()
             ? collect()
-
-            : CourseMaterial::query()->whereIn('course_id', $paidCourseIds)->get();
+            : CourseMaterial::query()->whereIn('course_id', $accessibleCourseIds)->get();
 
 
 
@@ -233,9 +263,9 @@ class LearnerDashboardController extends Controller
 
 
 
-        $upcomingClasses = $this->buildUpcomingClasses($paidCourseIds);
+        $upcomingClasses = $this->buildUpcomingClasses($accessibleCourseIds);
 
-        $notifications = $this->buildNotifications($paidCourseIds);
+        $notifications = $this->buildNotifications($accessibleCourseIds);
 
 
 
@@ -361,7 +391,7 @@ class LearnerDashboardController extends Controller
 
                 'courses_enrolled' => $enrollments->count(),
 
-                'active_courses' => $paidOrCompleted->count(),
+                'active_courses' => $accessibleEnrollments->count(),
 
                 'hours_learned' => $hoursLearned,
 
@@ -430,11 +460,8 @@ class LearnerDashboardController extends Controller
 
 
         $paidCourseIds = CourseEnrollment::query()
-
             ->where('student_id', $student->id)
-
-            ->whereIn('status', ['paid', 'completed'])
-
+            ->whereIn('status', EnrollmentStatusHelper::accessStatuses())
             ->pluck('course_id')
 
             ->filter()
@@ -471,7 +498,7 @@ class LearnerDashboardController extends Controller
         if (empty($allowedMeetingIds)) {
             return response()->json([
                 'recordings' => [],
-                'message' => 'Recordings are available only for paid live classes in your enrolled courses.',
+                'message' => 'Recordings are available for your enrolled live classes.',
             ], 200);
         }
 
@@ -674,7 +701,41 @@ class LearnerDashboardController extends Controller
 
         }
 
+        $recentQuizzes = CourseMaterial::query()
+            ->with('course:id,title')
+            ->whereIn('course_id', $paidCourseIds)
+            ->whereIn('type', ['quiz', 'assessment'])
+            ->orderByDesc('updated_at')
+            ->limit(30)
+            ->get()
+            ->filter(fn (CourseMaterial $material) => QuizMaterialHelper::isPublished($material));
 
+        foreach ($recentQuizzes as $material) {
+            $meta = QuizMaterialHelper::meta($material);
+            $publishedAt = $meta['published_at'] ?? $material->updated_at?->toIso8601String();
+            if ($publishedAt && Carbon::parse($publishedAt)->lt(now()->subDays(30))) {
+                continue;
+            }
+
+            $kind = (string) ($meta['assessment_kind'] ?? 'quiz');
+            $kindLabel = match ($kind) {
+                'exam' => 'Exam',
+                'test' => 'Test',
+                default => 'Quiz',
+            };
+
+            $notifications[] = [
+                'id' => 'assessment-' . $material->id,
+                'type' => 'assessment',
+                'title' => $kindLabel . ' available',
+                'message' => ($material->course?->title ?? 'Your course') . ': ' . ($material->title ?? 'Assessment'),
+                'created_at' => $publishedAt,
+                'course_id' => $material->course_id,
+                'material_id' => $material->id,
+                'quiz_id' => $material->id,
+                'action_path' => '/dashboard/learner/quiz/' . $material->id,
+            ];
+        }
 
         usort($notifications, fn ($a, $b) => strcmp($b['created_at'] ?? '', $a['created_at'] ?? ''));
 
@@ -684,6 +745,25 @@ class LearnerDashboardController extends Controller
 
     }
 
+    private function serializeLearnerShiftRequest($request, \App\Services\EnrollmentStudyShiftService $shiftService): ?array
+    {
+        if (!$request) {
+            return null;
+        }
+
+        $requestedShifts = \App\Models\StudyShift::query()
+            ->whereIn('id', $request->requested_study_shift_ids ?? [])
+            ->orderBy('day_of_week')
+            ->orderBy('start_time')
+            ->get();
+
+        return [
+            'id' => $request->id,
+            'status' => $request->status,
+            'reason' => $request->reason,
+            'created_at' => $request->created_at?->toIso8601String(),
+            'requested_shifts' => $shiftService->formatStudyShiftsForApi($requestedShifts),
+        ];
+    }
+
 }
-
-

@@ -31,16 +31,20 @@ class QuizQuestionValidator
 
     protected function rejectReason(array $q, array $seen): ?string
     {
+        $type = (string) ($q['type'] ?? '');
         $text = trim((string) ($q['question'] ?? ''));
-        if ($text === '' || strlen($text) < 10) {
+
+        if ($type !== 'oral_listen' && ($text === '' || strlen($text) < 10)) {
             return 'Question too short or empty';
         }
 
-        if (in_array(strtolower($text), $seen, true)) {
-            return 'Duplicate question';
+        if ($type === 'oral_listen' && $text === '' && empty($q['instruction'])) {
+            return 'Oral question needs instruction text';
         }
 
-        $type = (string) ($q['type'] ?? '');
+        if ($text !== '' && in_array(strtolower($text), $seen, true)) {
+            return 'Duplicate question';
+        }
         $answer = trim((string) ($q['correct_answer'] ?? ''));
 
         if ($type === 'true_false' && !in_array($answer, ['True', 'False'], true)) {
@@ -55,6 +59,18 @@ class QuizQuestionValidator
             if ($answer === '' || !in_array($answer, $options, true)) {
                 return 'MCQ correct answer must match an option';
             }
+        }
+
+        if ($type === 'oral_listen') {
+            if (empty($q['prompt_audio_url'])) {
+                return 'Oral question needs prompt audio';
+            }
+            $responseFormat = (string) ($q['response_format'] ?? 'text');
+            if (!in_array($responseFormat, ['text', 'audio'], true)) {
+                return 'Invalid oral response format';
+            }
+
+            return null;
         }
 
         if (($q['confidence_score'] ?? 1) < 0.35) {

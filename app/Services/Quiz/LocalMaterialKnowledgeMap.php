@@ -27,15 +27,13 @@ class LocalMaterialKnowledgeMap
         $lines = preg_split('/\r\n|\r|\n/u', $text) ?: [];
         $paragraphs = preg_split("/\n{2,}/u", $text) ?: [];
 
-        $headings = $this->extractHeadings($lines, $label);
+        $modules = $this->extractModuleHeadings($lines);
+        $headings = $modules !== [] ? $modules : $this->extractHeadings($lines, $label);
+        $headings = $this->cleanTopicHeadings($headings, $label);
         $definitions = $this->extractDefinitions($lines);
         $keyConcepts = $this->extractKeyTerms($text, $headings);
         $outcomes = $this->extractLearningOutcomes($lines);
         $subtopics = array_slice($headings, 1, 12);
-
-        if ($headings === []) {
-            $headings = [$label];
-        }
 
         return [
             'map' => [
@@ -66,7 +64,7 @@ class LocalMaterialKnowledgeMap
             }
 
             if (preg_match('/^(chapter|section|module|unit|part|topic)\s+[\d\.]+[:\.]?\s*(.+)$/iu', $line, $m)) {
-                $headings[] = trim($m[2]);
+                $headings[] = trim($m[0]);
                 continue;
             }
 
@@ -88,11 +86,61 @@ class LocalMaterialKnowledgeMap
 
         $headings = array_values(array_unique(array_filter($headings, fn ($h) => strlen($h) >= 4)));
 
-        if ($headings === [] && $label !== '') {
-            $headings[] = $label;
+        return $headings;
+    }
+
+    /**
+     * @param  array<int, string>  $lines
+     * @return array<int, string>
+     */
+    protected function extractModuleHeadings(array $lines): array
+    {
+        $modules = [];
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '' || strlen($line) > 160) {
+                continue;
+            }
+
+            if (preg_match('/^module\s+\d+\s*[:\-–—]\s*.+/iu', $line)) {
+                $modules[] = $line;
+            }
         }
 
-        return $headings;
+        return array_values(array_unique($modules));
+    }
+
+    /**
+     * @param  array<int, string>  $headings
+     * @return array<int, string>
+     */
+    protected function cleanTopicHeadings(array $headings, string $label): array
+    {
+        $clean = [];
+
+        foreach ($headings as $heading) {
+            $heading = trim((string) $heading);
+            if ($heading === '' || strlen($heading) < 3) {
+                continue;
+            }
+            if (preg_match('/\.pdf$/i', $heading)) {
+                continue;
+            }
+            if (preg_match('/^(learning objectives|key points|read the lesson|take notes)/i', $heading)) {
+                continue;
+            }
+            if (str_contains(strtolower($heading), 'sample study guide is intentionally')) {
+                continue;
+            }
+            if (strtolower($heading) === strtolower(trim($label))) {
+                continue;
+            }
+
+            $clean[] = $heading;
+        }
+
+        return array_values(array_unique($clean));
     }
 
     /**

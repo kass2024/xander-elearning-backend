@@ -8,6 +8,9 @@ use App\Services\Quiz\QuizDocumentEngine;
 use App\Services\Quiz\QuizMaterialAnalysisService;
 use App\Services\Quiz\QuizQuestionValidator;
 use App\Support\QuizMaterialHelper;
+use App\Support\MaterialLanguageHelper;
+use App\Services\Quiz\QuizAnswerMatcher;
+use App\Services\Quiz\QuizOptionSorter;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -32,6 +35,7 @@ class QuizAiService
         'problem_solving',
         'scenario',
         'hots',
+        'oral_listen',
     ];
 
     public function __construct(
@@ -86,16 +90,84 @@ class QuizAiService
         }
 
         $context = $this->formatGenerationContext($course, $topic, $materials, $rag['context'], $knowledgeMap);
+
+        $language = MaterialLanguageHelper::detectFromText($rag['context'], $topic);
+        $options['assessment_language'] = $language['code'];
+        $options['assessment_language_label'] = $language['label'];
+        $options['language_instruction'] = $language['instruction'];
+
+        $batchSize = max(5, (int) config('services.quiz_ai.generation_batch_size', 10));
+        $useParallel = filter_var(config('services.quiz_ai.parallel_generation_batches', true), FILTER_VALIDATE_BOOL)
+            && $count > $batchSize
+            && $this->hasGemini();
+
+        if ($useParallel) {
+            $result = $this->generateQuestionsInParallelBatches(
+                $course,
+                $topic,
+                $count,
+                $difficulty,
+                $context,
+                $options,
+                $batchSize,
+                $knowledgeMap,
+                $rag['content_hash'] ?? null,
+            );
+        } else {
+            $result = $this->generateQuestionsSingleCall(
+                $course,
+                $topic,
+                $count,
+                $difficulty,
+                $context,
+                $options,
+                $knowledgeMap,
+                $rag['content_hash'] ?? null,
+            );
+        }
+
+        return $this->attachAssessmentLanguage($result, $options);
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @param  array<string, mixed>  $options
+     * @return array<string, mixed>
+     */
+    protected function attachAssessmentLanguage(array $result, array $options): array
+    {
+        if (!empty($options['assessment_language'])) {
+            $result['assessment_language'] = $options['assessment_language'];
+            $result['assessment_language_label'] = $options['assessment_language_label'] ?? MaterialLanguageHelper::label((string) $options['assessment_language']);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @param  array<string, mixed>|null  $knowledgeMap
+     * @return array{questions: array<int, array>, provider: string, knowledge_map?: array, rejected?: array, insufficient?: bool}
+     */
+    protected function generateQuestionsSingleCall(
+        Course $course,
+        string $topic,
+        int $count,
+        string $difficulty,
+        string $context,
+        array $options,
+        ?array $knowledgeMap,
+        ?string $contentHash,
+    ): array {
         $prompt = $this->generationPrompt($course, $topic, $count, $difficulty, $context, $options);
-        $maxTokens = min(8192, max(1200, ($count * 320) + 300));
+        $maxTokens = $this->generationMaxTokens($count);
 
         $raw = null;
         $provider = 'gemini';
-        $generationModel = $this->resolveGenerationModel();
 
         foreach ($this->resolveAiProviderOrder('generation') as $name) {
             if ($name === 'claude' && $this->hasClaude()) {
-                $raw = $this->callClaude($prompt, $maxTokens, $generationModel);
+                $raw = $this->callClaude($prompt, $maxTokens, $this->resolveGenerationModel());
                 $provider = 'claude';
             } elseif ($name === 'gemini' && $this->hasGemini()) {
                 $raw = $this->callGemini($prompt, $maxTokens, true);
@@ -112,6 +184,137 @@ class QuizAiService
             throw new \RuntimeException('AI quiz generation failed: ' . $detail);
         }
 
+        return $this->finalizeGeneratedQuestions($raw, $count, $options, $provider, $knowledgeMap, $contentHash);
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @param  array<string, mixed>|null  $knowledgeMap
+     * @return array{questions: array<int, array>, provider: string, knowledge_map?: array, rejected?: array, insufficient?: bool}
+     */
+    protected function generateQuestionsInParallelBatches(
+        Course $course,
+        string $topic,
+        int $count,
+        string $difficulty,
+        string $context,
+        array $options,
+        int $batchSize,
+        ?array $knowledgeMap,
+        ?string $contentHash,
+    ): array {
+        $batches = [];
+        $remaining = $count;
+        while ($remaining > 0) {
+            $batchCount = min($batchSize, $remaining);
+            $batches[] = $batchCount;
+            $remaining -= $batchCount;
+        }
+
+        $model = config('services.quiz_ai.generation_model')
+            ?: config('services.gemini.model', 'gemini-2.5-flash');
+        $keys = $this->geminiApiKeys();
+        $key = reset($keys);
+        if (!is_string($key) || $key === '') {
+            return $this->generateQuestionsSingleCall(
+                $course,
+                $topic,
+                $count,
+                $difficulty,
+                $context,
+                $options,
+                $knowledgeMap,
+                $contentHash,
+            );
+        }
+
+        $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$key}";
+        $responses = Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($batches, $course, $topic, $difficulty, $context, $options, $url) {
+            $requests = [];
+            foreach ($batches as $index => $batchCount) {
+                $prompt = $this->generationPrompt($course, $topic, $batchCount, $difficulty, $context, $options, $index + 1);
+                $maxTokens = $this->generationMaxTokens($batchCount);
+                $requests[] = $pool->as("batch_{$index}")
+                    ->timeout(75)
+                    ->connectTimeout(12)
+                    ->post($url, [
+                        'contents' => [['parts' => [['text' => $prompt]]]],
+                        'generationConfig' => $this->buildGeminiGenerationConfig($maxTokens, true),
+                    ]);
+            }
+
+            return $requests;
+        });
+
+        $allQuestions = [];
+        $rejected = [];
+
+        foreach ($batches as $index => $batchCount) {
+            $response = $responses["batch_{$index}"] ?? null;
+            if (!$response || !$response->successful()) {
+                $status = $response?->status() ?? 0;
+                $this->lastAiError = $this->summarizeHttpError('Gemini batch', $status, (string) ($response?->body() ?? ''));
+                continue;
+            }
+
+            $raw = $this->extractGeminiText(is_array($response->json()) ? $response->json() : null);
+            if ($raw === '') {
+                continue;
+            }
+
+            try {
+                $parsed = $this->parseQuestionsJson($raw);
+            } catch (\Throwable $e) {
+                Log::warning('Gemini batch JSON parse failed', [
+                    'batch' => $index,
+                    'finish' => data_get($response->json(), 'candidates.0.finishReason'),
+                    'error' => $e->getMessage(),
+                    'snippet' => substr($raw, 0, 240),
+                ]);
+                continue;
+            }
+            if (!empty($parsed['insufficient'])) {
+                continue;
+            }
+
+            $normalized = $this->normalizeQuestions($parsed['questions'] ?? $parsed, $options);
+            $validated = $this->questionValidator->validate($normalized);
+            $allQuestions = array_merge($allQuestions, $validated['questions']);
+            $rejected = array_merge($rejected, $validated['rejected']);
+        }
+
+        if (count($allQuestions) < max(1, (int) ceil($count * 0.5))) {
+            throw new \RuntimeException('AI quiz generation failed: ' . ($this->lastAiError ?: 'Parallel batches returned too few questions.'));
+        }
+
+        $allQuestions = array_slice($allQuestions, 0, $count);
+        foreach ($allQuestions as $i => &$question) {
+            $question['id'] = 'q' . ($i + 1);
+        }
+        unset($question);
+
+        return [
+            'questions' => $allQuestions,
+            'provider' => 'gemini',
+            'knowledge_map' => $knowledgeMap,
+            'rejected' => $rejected,
+            'content_hash' => $contentHash,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @param  array<string, mixed>|null  $knowledgeMap
+     * @return array{questions: array<int, array>, provider: string, knowledge_map?: array, rejected?: array, insufficient?: bool}
+     */
+    protected function finalizeGeneratedQuestions(
+        string $raw,
+        int $count,
+        array $options,
+        string $provider,
+        ?array $knowledgeMap,
+        ?string $contentHash,
+    ): array {
         $parsed = $this->parseQuestionsJson($raw);
 
         if (!empty($parsed['insufficient'])) {
@@ -133,7 +336,7 @@ class QuizAiService
             'provider' => $provider,
             'knowledge_map' => $knowledgeMap,
             'rejected' => $validated['rejected'],
-            'content_hash' => $rag['content_hash'] ?? null,
+            'content_hash' => $contentHash,
         ];
     }
 
@@ -142,19 +345,20 @@ class QuizAiService
      * @param  array<string, mixed>  $answers
      * @return array<string, mixed>
      */
-    public function markAttempt(array $questions, array $answers, int $passingScore = 70): array
+    public function markAttempt(array $questions, array $answers, int $passingScore = 70, ?string $assessmentLanguage = null): array
     {
         $results = [];
         $score = 0;
         $maxScore = 0;
         $openItems = [];
+        $pendingManual = 0;
 
         foreach ($questions as $question) {
             $qid = (string) ($question['id'] ?? '');
             $points = (int) ($question['points'] ?? 1);
             $maxScore += $points;
             $type = (string) ($question['type'] ?? 'multiple_choice');
-            $studentAnswer = $answers[$qid] ?? '';
+            $studentAnswer = QuizAnswerMatcher::lookupAnswer($answers, $qid);
 
             if ($type === 'true_false') {
                 $results[] = $this->markExact($question, $studentAnswer, $points, $qid);
@@ -184,6 +388,40 @@ class QuizAiService
             if ($type === 'fill_blank') {
                 $results[] = $this->markFillBlank($question, $studentAnswer, $points, $qid);
                 $score += $results[array_key_last($results)]['score'];
+                continue;
+            }
+
+            if ($type === 'oral_listen') {
+                $prepared = $this->prepareOralAnswer($question, $studentAnswer);
+                if ($prepared === null) {
+                    $results[] = [
+                        'question_id' => $qid,
+                        'type' => $type,
+                        'correct' => false,
+                        'score' => 0,
+                        'max_score' => $points,
+                        'student_answer' => '',
+                        'feedback' => 'No answer provided.',
+                        'marked_by' => 'manual',
+                        'pending_review' => false,
+                    ];
+                    continue;
+                }
+
+                $pendingManual++;
+                $results[] = [
+                    'question_id' => $qid,
+                    'type' => $type,
+                    'correct' => null,
+                    'score' => 0,
+                    'max_score' => $points,
+                    'student_answer' => $prepared['original'],
+                    'transcription' => $prepared['transcription'] ?? null,
+                    'feedback' => 'Awaiting instructor review.',
+                    'marked_by' => 'manual_pending',
+                    'pending_review' => true,
+                    'response_format' => $question['response_format'] ?? 'text',
+                ];
                 continue;
             }
 
@@ -217,36 +455,128 @@ class QuizAiService
         $analytics = null;
 
         if ($openItems !== []) {
-            $aiMark = $this->markOpenAnswersWithAi($openItems);
+            $languageCode = $assessmentLanguage;
+            if (!$languageCode) {
+                $sample = implode(' ', array_map(
+                    fn ($item) => (string) (($item['question'] ?? '') . ' ' . ($item['model_answer'] ?? '')),
+                    $openItems
+                ));
+                $languageCode = MaterialLanguageHelper::detectFromText($sample)['code'];
+            }
+
+            $aiMark = $this->markOpenAnswersWithAi($openItems, $languageCode);
             $markingProvider = $aiMark['provider'];
             $overallFeedback = $aiMark['overall_feedback'] ?? '';
 
             foreach ($aiMark['results'] as $row) {
                 $score += (int) ($row['score'] ?? 0);
+                if (!empty($row['question_id'])) {
+                    foreach ($openItems as $item) {
+                        if (($item['question_id'] ?? '') === ($row['question_id'] ?? '')) {
+                            if (!empty($item['original_answer'])) {
+                                $row['student_answer'] = $item['original_answer'];
+                            }
+                            if (!empty($item['transcription'])) {
+                                $row['transcription'] = $item['transcription'];
+                            }
+                            break;
+                        }
+                    }
+                }
                 $results[] = $row;
             }
         }
 
         $percentage = $maxScore > 0 ? round(($score / $maxScore) * 100, 2) : 0;
 
-        if ($this->hasClaude()) {
+        if ($pendingManual > 0) {
+            $markingProvider = 'manual';
+            $overallFeedback = $openItems === []
+                ? 'Submitted. Your instructor will review your oral responses and publish your final score.'
+                : 'Submitted. Some answers were auto-marked; oral responses await instructor review.';
+        }
+
+        if ($pendingManual === 0 && ($this->hasGemini() || $this->hasClaude())) {
             $analytics = $this->buildPersonalizedFeedback($results, $percentage, $passingScore);
             if ($analytics && empty($overallFeedback)) {
                 $overallFeedback = (string) ($analytics['summary'] ?? '');
             }
         }
 
+        $passed = $pendingManual === 0 && $percentage >= $passingScore;
+
         return [
             'question_results' => $results,
             'score' => $score,
             'max_score' => $maxScore,
             'percentage' => $percentage,
-            'passed' => $percentage >= $passingScore,
-            'feedback' => $overallFeedback ?: ($percentage >= $passingScore
-                ? 'Well done! You passed this quiz.'
-                : 'Keep studying this topic and try again.'),
+            'passed' => $passed,
+            'feedback' => $overallFeedback ?: ($pendingManual > 0
+                ? 'Submitted. Your instructor will review your oral responses.'
+                : ($passed
+                    ? 'Well done! You passed this quiz.'
+                    : 'Keep studying this topic and try again.')),
             'marking_provider' => $markingProvider,
             'analytics' => $analytics,
+            'pending_manual_review' => $pendingManual > 0,
+        ];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $questionResults
+     * @param  array<int, array<string, mixed>>  $grades
+     * @return array<string, mixed>
+     */
+    public function applyManualGrades(array $questionResults, array $grades, int $passingScore = 70): array
+    {
+        $byId = [];
+        foreach ($grades as $grade) {
+            $qid = (string) ($grade['question_id'] ?? '');
+            if ($qid !== '') {
+                $byId[$qid] = $grade;
+            }
+        }
+
+        $score = 0;
+        $maxScore = 0;
+        $pending = 0;
+
+        $updated = array_map(function (array $row) use ($byId, &$score, &$maxScore, &$pending) {
+            $max = (int) ($row['max_score'] ?? 0);
+            $maxScore += $max;
+            $qid = (string) ($row['question_id'] ?? '');
+
+            if (($row['type'] ?? '') === 'oral_listen' && !empty($row['pending_review']) && isset($byId[$qid])) {
+                $grade = $byId[$qid];
+                $given = min($max, max(0, (int) ($grade['score'] ?? 0)));
+                $row['score'] = $given;
+                $row['correct'] = $max > 0 ? $given >= $max : $given > 0;
+                $row['feedback'] = trim((string) ($grade['feedback'] ?? '')) ?: 'Marked by instructor.';
+                $row['marked_by'] = 'manual';
+                $row['pending_review'] = false;
+                $score += $given;
+            } elseif (!empty($row['pending_review'])) {
+                $pending++;
+                $score += (int) ($row['score'] ?? 0);
+            } else {
+                $score += (int) ($row['score'] ?? 0);
+            }
+
+            return $row;
+        }, $questionResults);
+
+        $percentage = $maxScore > 0 ? round(($score / $maxScore) * 100, 2) : 0;
+
+        return [
+            'question_results' => $updated,
+            'score' => $score,
+            'max_score' => $maxScore,
+            'percentage' => $percentage,
+            'passed' => $pending === 0 && $percentage >= $passingScore,
+            'pending_manual_review' => $pending > 0,
+            'feedback' => $pending > 0
+                ? 'Partially marked — some oral responses still await review.'
+                : ($percentage >= $passingScore ? 'Marked complete — you passed.' : 'Marked complete — review your feedback.'),
         ];
     }
 
@@ -274,6 +604,10 @@ class QuizAiService
                 $q['options'] = ['True', 'False'];
             }
 
+            if (in_array($type, ['multiple_choice', 'multiple_response'], true) && isset($q['options']) && is_array($q['options'])) {
+                $q['options'] = QuizOptionSorter::sort($q['options']);
+            }
+
             if ($type === 'matching' && isset($q['pairs']) && is_array($q['pairs'])) {
                 $q['pairs'] = array_values(array_map(
                     fn ($p) => ['left' => (string) ($p['left'] ?? '')],
@@ -288,6 +622,10 @@ class QuizAiService
                 unset($q['acceptable_answers']);
             }
 
+            if ($type === 'oral_listen') {
+                // Keep prompt audio + response format for learner UI; hide model answer/rubric.
+            }
+
             return $q;
         }, $questions);
     }
@@ -297,18 +635,6 @@ class QuizAiService
      */
     protected function resolveQuestionCount(int $count, array $options): int
     {
-        $mode = (string) ($options['quiz_mode'] ?? 'custom');
-        $presets = [
-            'quick' => 5,
-            'standard' => 10,
-            'comprehensive' => 20,
-            'final_exam' => 50,
-        ];
-
-        if (isset($presets[$mode])) {
-            return $presets[$mode];
-        }
-
         return max(1, min(100, $count));
     }
 
@@ -330,6 +656,10 @@ class QuizAiService
      */
     protected function resolveAiProviderOrder(string $context = 'generation'): array
     {
+        if (filter_var(config('services.quiz_ai.gemini_only', true), FILTER_VALIDATE_BOOL) && $this->hasGemini()) {
+            return ['gemini'];
+        }
+
         if ($context === 'marking') {
             $primary = strtolower((string) config('services.quiz_ai.marking_primary', 'gemini'));
             $secondary = strtolower((string) config('services.quiz_ai.marking_secondary', 'claude'));
@@ -403,9 +733,13 @@ class QuizAiService
         int $count,
         string $difficulty,
         string $context,
-        array $options = []
+        array $options = [],
+        int $batchNumber = 1,
     ): string {
-        $types = $options['question_types'] ?? ['multiple_choice', 'true_false'];
+        $types = array_values(array_filter(
+            $options['question_types'] ?? ['multiple_choice', 'true_false'],
+            fn ($t) => $t !== 'oral_listen'
+        ));
         if (!is_array($types) || $types === []) {
             $types = ['multiple_choice', 'true_false'];
         }
@@ -421,54 +755,25 @@ class QuizAiService
         $bloomList = implode(', ', $bloom);
         $typeList = implode(', ', $types);
         $difficulty = in_array($difficulty, ['easy', 'medium', 'hard', 'mixed'], true) ? $difficulty : 'medium';
+        $batchNote = $batchNumber > 1 ? "\nBatch {$batchNumber}: generate different questions from earlier batches." : '';
+        $langInstruction = (string) ($options['language_instruction']
+            ?? MaterialLanguageHelper::promptInstruction((string) ($options['assessment_language'] ?? 'en')));
 
         return <<<PROMPT
-You are an expert assessment designer for Xander Learning Hub.
+{$langInstruction}
 
-Generate exactly {$count} quiz questions with difficulty "{$difficulty}" focused on topic "{$topic}".
+Generate exactly {$count} quiz questions (difficulty: {$difficulty}, topic: "{$topic}").{$batchNote}
 
-STRICT CONTENT RULE:
-- Use ONLY the retrieved study material below.
-- DO NOT invent facts or use external knowledge.
-- If the material lacks enough distinct facts for {$count} quality questions, return:
-  {"insufficient": true, "questions": []}
+Use ONLY the study material below. If insufficient facts, return {"insufficient": true, "questions": []}.
 
-Allowed question types: {$typeList}
-Target Bloom levels: {$bloomList}
+Types: {$typeList} | Bloom: {$bloomList}
 
 {$context}
 
 Return JSON only:
-{
-  "questions": [
-    {
-      "id": "q1",
-      "question": "...",
-      "type": "multiple_choice",
-      "difficulty": "medium",
-      "bloom_level": "understand",
-      "source_section": "section from material",
-      "source_paragraph": "brief excerpt reference",
-      "options": ["A","B","C","D"],
-      "correct_answer": "B",
-      "explanation": "why this is correct based on the material",
-      "confidence_score": 0.92,
-      "estimated_time": 60,
-      "points": 1
-    }
-  ]
-}
+{"questions":[{"id":"q1","question":"...","type":"multiple_choice","difficulty":"medium","bloom_level":"understand","source_section":"...","options":["A","B","C","D"],"correct_answer":"B","explanation":"...","confidence_score":0.9,"points":1}]}
 
-Rules:
-- ids q1..q{$count}
-- Every question must cite source_section from the material
-- confidence_score 0.0-1.0 (reject below 0.5)
-- For true_false: correct_answer is "True" or "False"
-- For multiple_choice: exactly 4 options
-- For multiple_response: use correct_answers array with 2+ values, options array 4-5 items
-- For fill_blank: use blanks in question with ___, correct_answer or acceptable_answers array
-- For essay/long_answer/case_study: include model_answer and marking_rubric
-- Mix types as requested; prefer material-specific factual questions
+Rules: ids q1..q{$count}; multiple_choice needs 4 options; true_false answer is True or False; cite source_section from material.
 PROMPT;
     }
 
@@ -507,9 +812,9 @@ PROMPT;
 
     protected function markExact(array $question, mixed $studentAnswer, int $points, string $qid): array
     {
-        $correct = trim((string) ($question['correct_answer'] ?? ''));
-        $student = trim((string) $studentAnswer);
-        $isCorrect = $student !== '' && strcasecmp($student, $correct) === 0;
+        $correct = QuizAnswerMatcher::resolveCorrectText($question);
+        $student = QuizAnswerMatcher::normalize((string) $studentAnswer);
+        $isCorrect = QuizAnswerMatcher::matchesExact($question, $studentAnswer);
 
         return [
             'question_id' => $qid,
@@ -517,7 +822,7 @@ PROMPT;
             'correct' => $isCorrect,
             'score' => $isCorrect ? $points : 0,
             'max_score' => $points,
-            'student_answer' => $studentAnswer,
+            'student_answer' => $student !== '' ? $student : $studentAnswer,
             'correct_answer' => $correct,
             'explanation' => $question['explanation'] ?? null,
             'marked_by' => 'auto',
@@ -526,10 +831,20 @@ PROMPT;
 
     protected function markMultipleResponse(array $question, mixed $studentAnswer, int $points, string $qid): array
     {
-        $correct = array_map('strval', $question['correct_answers'] ?? [$question['correct_answer'] ?? '']);
+        $correctRaw = $question['correct_answers'] ?? [$question['correct_answer'] ?? ''];
+        if (!is_array($correctRaw)) {
+            $correctRaw = [$correctRaw];
+        }
+        $correct = array_values(array_filter(array_map(
+            fn ($answer) => QuizAnswerMatcher::resolveCorrectText($question, (string) $answer),
+            $correctRaw
+        )));
         $student = is_array($studentAnswer)
-            ? array_map('strval', $studentAnswer)
-            : array_filter(array_map('trim', explode(',', (string) $studentAnswer)));
+            ? array_map(fn ($answer) => QuizAnswerMatcher::resolveCorrectText($question, (string) $answer), $studentAnswer)
+            : array_filter(array_map(
+                fn ($part) => QuizAnswerMatcher::resolveCorrectText($question, $part),
+                explode(',', (string) $studentAnswer)
+            ));
 
         sort($correct);
         sort($student);
@@ -610,11 +925,100 @@ PROMPT;
         ];
     }
 
-    protected function markOpenAnswersWithAi(array $openItems): array
+    /**
+     * @param  array<string, mixed>  $question
+     * @return array{text: string, original: string, transcription?: string}|null
+     */
+    protected function prepareOralAnswer(array $question, mixed $studentAnswer): ?array
+    {
+        $raw = trim((string) $studentAnswer);
+        if ($raw === '') {
+            return null;
+        }
+
+        $responseFormat = (string) ($question['response_format'] ?? 'text');
+
+        if (str_starts_with($raw, 'audio:')) {
+            $inner = substr($raw, 6);
+            $transcription = $this->transcribeStoredAudio($inner);
+            if ($transcription === null || trim($transcription) === '') {
+                return [
+                    'text' => '[Audio answer — transcription unavailable]',
+                    'original' => $raw,
+                ];
+            }
+
+            return [
+                'text' => $transcription,
+                'original' => $raw,
+                'transcription' => $transcription,
+            ];
+        }
+
+        if ($responseFormat === 'audio') {
+            return null;
+        }
+
+        return [
+            'text' => $raw,
+            'original' => $raw,
+        ];
+    }
+
+    public function transcribeStoredAudio(string $storagePath): ?string
+    {
+        $parsed = \App\Support\QuizAudioHelper::parseRef($storagePath);
+        if ($parsed === null) {
+            $parsed = \App\Support\QuizAudioHelper::parseRef('audio:' . ltrim($storagePath, '/'));
+        }
+
+        if (($parsed['type'] ?? '') === 'pcloud') {
+            $fileId = (int) ($parsed['file_id'] ?? 0);
+            $pcloud = app(\App\Services\PCloudService::class);
+            if ($fileId <= 0 || !$pcloud->isConfigured()) {
+                return null;
+            }
+
+            try {
+                $url = $pcloud->downloadLink($fileId);
+                $response = \Illuminate\Support\Facades\Http::timeout(120)->get($url);
+                if (!$response->successful()) {
+                    return null;
+                }
+                $bytes = $response->body();
+                $filename = 'answer-' . $fileId . '.webm';
+
+                return $this->documentReader->transcribeMediaBytes($bytes, $filename);
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        $path = (string) ($parsed['path'] ?? ltrim(str_replace(['\\', '..'], ['/', ''], $storagePath), '/'));
+        if ($path === '' || !str_starts_with($path, 'uploads/quiz-audio/')) {
+            return null;
+        }
+
+        $disk = \Illuminate\Support\Facades\Storage::disk('public');
+        if (!$disk->exists($path)) {
+            return null;
+        }
+
+        $bytes = $disk->get($path);
+        $filename = basename($path);
+
+        return $this->documentReader->transcribeMediaBytes($bytes, $filename);
+    }
+
+    protected function markOpenAnswersWithAi(array $openItems, ?string $languageCode = null): array
     {
         $payload = json_encode(['items' => $openItems], JSON_UNESCAPED_UNICODE);
+        $langInstruction = MaterialLanguageHelper::markingFeedbackInstruction($languageCode ?: 'en');
         $prompt = <<<PROMPT
 Grade these open-ended quiz answers using ONLY the model answers/rubrics provided.
+For oral_listen items, evaluate comprehension/summary quality against the model answer or rubric.
+
+{$langInstruction}
 
 Essay rubric weights:
 - Content accuracy 30%
@@ -816,15 +1220,9 @@ PROMPT;
         }
 
         $model = config('services.quiz_ai.generation_model')
-            ?: config('services.gemini.model', 'gemini-2.0-flash');
+            ?: config('services.gemini.model', 'gemini-2.5-flash');
 
-        $generationConfig = [
-            'temperature' => 0.25,
-            'maxOutputTokens' => $maxTokens,
-        ];
-        if ($jsonMode) {
-            $generationConfig['responseMimeType'] = 'application/json';
-        }
+        $generationConfig = $this->buildGeminiGenerationConfig($maxTokens, $jsonMode);
 
         $payload = [
             'contents' => [['parts' => [['text' => $prompt]]]],
@@ -835,14 +1233,20 @@ PROMPT;
             $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$key}";
 
             try {
-                $response = Http::timeout(90)->connectTimeout(15)->post($url, $payload);
+                $response = Http::timeout(75)->connectTimeout(12)->post($url, $payload);
 
                 if (!$response->successful()) {
                     $this->lastAiError = $this->summarizeHttpError("Gemini ({$keyLabel})", $response->status(), $response->body());
                     continue;
                 }
 
-                $text = (string) data_get($response->json(), 'candidates.0.content.parts.0.text', '');
+                $responseJson = $response->json();
+                $finishReason = (string) data_get($responseJson, 'candidates.0.finishReason', '');
+                if ($finishReason === 'MAX_TOKENS') {
+                    $this->lastAiError = 'Gemini output was truncated (MAX_TOKENS). Try fewer questions per batch.';
+                }
+
+                $text = $this->extractGeminiText(is_array($responseJson) ? $responseJson : null);
                 if ($text !== '') {
                     return $text;
                 }
@@ -852,6 +1256,61 @@ PROMPT;
         }
 
         return null;
+    }
+
+    protected function generationMaxTokens(int $questionCount): int
+    {
+        return min(8192, max(1800, ($questionCount * 380) + 600));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function buildGeminiGenerationConfig(int $maxTokens, bool $jsonMode = false): array
+    {
+        $config = [
+            'temperature' => 0.2,
+            'maxOutputTokens' => $maxTokens,
+            // Gemini 2.5 "thinking" tokens consume the output budget and truncate JSON — disable for quiz generation.
+            'thinkingConfig' => ['thinkingBudget' => 0],
+        ];
+
+        if ($jsonMode) {
+            $config['responseMimeType'] = 'application/json';
+        }
+
+        return $config;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $responseJson
+     */
+    protected function extractGeminiText(?array $responseJson): string
+    {
+        if (!is_array($responseJson)) {
+            return '';
+        }
+
+        $parts = data_get($responseJson, 'candidates.0.content.parts', []);
+        if (!is_array($parts)) {
+            return '';
+        }
+
+        $texts = [];
+        foreach ($parts as $part) {
+            if (!is_array($part)) {
+                continue;
+            }
+            if (!empty($part['thought'])) {
+                continue;
+            }
+            $text = trim((string) ($part['text'] ?? ''));
+            if ($text !== '') {
+                $texts[] = $text;
+            }
+        }
+
+        return trim(implode("\n", $texts));
     }
 
     /** @return array<string, string> */
@@ -888,8 +1347,9 @@ PROMPT;
     protected function parseQuestionsJson(string $raw): array
     {
         $raw = trim($raw);
+        $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw) ?? $raw;
         $raw = preg_replace('/^```(?:json)?\s*/i', '', $raw) ?? $raw;
-        $raw = preg_replace('/\s*```$/', '', $raw) ?? $raw;
+        $raw = preg_replace('/\s*```\s*$/', '', $raw) ?? $raw;
 
         $start = strpos($raw, '{');
         $end = strrpos($raw, '}');
@@ -897,12 +1357,67 @@ PROMPT;
             $raw = substr($raw, $start, $end - $start + 1);
         }
 
-        $decoded = json_decode($raw, true);
-        if (!is_array($decoded)) {
-            throw new \RuntimeException('AI returned invalid JSON.');
+        $decoded = $this->decodeJsonLenient($raw);
+        if (is_array($decoded)) {
+            return $decoded;
         }
 
-        return $decoded;
+        $repaired = $this->repairTruncatedQuestionsJson($raw);
+        if ($repaired !== null) {
+            return $repaired;
+        }
+
+        Log::warning('Quiz AI JSON parse failed', ['snippet' => substr($raw, 0, 400)]);
+
+        throw new \RuntimeException('AI returned invalid JSON. Try fewer questions or regenerate.');
+    }
+
+    protected function decodeJsonLenient(string $raw): ?array
+    {
+        $attempts = [
+            $raw,
+            preg_replace('/,\s*([}\]])/', '$1', $raw) ?? $raw,
+            preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $raw) ?? $raw,
+        ];
+
+        foreach ($attempts as $candidate) {
+            $decoded = json_decode($candidate, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    protected function repairTruncatedQuestionsJson(string $raw): ?array
+    {
+        if (!str_contains($raw, '"questions"')) {
+            return null;
+        }
+
+        $attempt = rtrim($raw);
+        for ($i = 0; $i < 6; $i++) {
+            $attempt = preg_replace('/,\s*"[^"]*$/', '', $attempt) ?? $attempt;
+            $attempt = preg_replace('/,\s*$/', '', $attempt) ?? $attempt;
+
+            if (!str_ends_with($attempt, ']')) {
+                $attempt .= ']';
+            }
+            if (!str_ends_with($attempt, '}')) {
+                $attempt .= '}';
+            }
+
+            $decoded = $this->decodeJsonLenient($attempt);
+            if (is_array($decoded) && !empty($decoded['questions']) && is_array($decoded['questions'])) {
+                return $decoded;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -936,9 +1451,11 @@ PROMPT;
             $optionsList = array_values($q['options'] ?? []);
             if ($type === 'true_false') {
                 $optionsList = ['True', 'False'];
+            } elseif (in_array($type, ['multiple_choice', 'multiple_response'], true) && count($optionsList) >= 2) {
+                $optionsList = QuizOptionSorter::sort($optionsList);
             }
 
-            $normalized[] = array_filter([
+            $normalizedQuestion = array_filter([
                 'id' => (string) ($q['id'] ?? ('q' . $i)),
                 'type' => $type,
                 'question' => (string) ($q['question'] ?? 'Question'),
@@ -958,6 +1475,7 @@ PROMPT;
                 'estimated_time' => (int) ($q['estimated_time'] ?? 60),
                 'points' => max(1, (int) ($q['points'] ?? 1)),
             ], fn ($v) => $v !== null && $v !== '');
+            $normalized[] = QuizAnswerMatcher::normalizeQuestionAnswers($normalizedQuestion);
             $i++;
         }
 

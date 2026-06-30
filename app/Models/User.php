@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use App\Models\Course;
+use App\Models\PlatformInstitution;
 
 class User extends Authenticatable
 {
@@ -25,6 +26,7 @@ class User extends Authenticatable
         'role',
         'status',
          'phone',
+        'platform_institution_id',
     ];
 
     /**
@@ -58,5 +60,10 @@ class User extends Authenticatable
             'user_id',
             'course_id'
         );
+    }
+
+    public function platformInstitution()
+    {
+        return $this->belongsTo(PlatformInstitution::class, 'platform_institution_id');
     }
 }

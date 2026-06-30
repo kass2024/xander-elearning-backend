@@ -3,6 +3,7 @@
 namespace App\Providers;
 
 use App\Services\DatabaseSchemaService;
+use App\Services\InstitutionMailResolver;
 use App\Services\MailDeliveryService;
 use App\Services\StripePaymentService;
 use Illuminate\Support\Facades\Log;
@@ -14,6 +15,7 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->singleton(DatabaseSchemaService::class);
         $this->app->singleton(MailDeliveryService::class);
+        $this->app->singleton(InstitutionMailResolver::class);
         $this->app->singleton(StripePaymentService::class);
     }
 
@@ -27,7 +29,11 @@ class AppServiceProvider extends ServiceProvider
             }
         }
 
-        if (!config('app.auto_migrate') || $this->app->runningInConsole()) {
+        if (!config('app.auto_migrate')) {
+            return;
+        }
+
+        if ($this->app->runningInConsole() && !DatabaseSchemaService::shouldAutoMigrateCli()) {
             return;
         }
 
@@ -39,9 +45,8 @@ class AppServiceProvider extends ServiceProvider
                 return;
             }
 
-            if (count($schema->pendingMigrations()) > 0 || !$schema->schemaReady()) {
-                $schema->runMigrations();
-            }
+            $schema->ensureMigrated();
+            $schema->ensureDemoData();
         } catch (\Throwable $e) {
             Log::warning('AUTO_MIGRATE skipped', ['error' => $e->getMessage()]);
         }

@@ -80,6 +80,10 @@ class QuizMaterialHelper
 
         $title = trim((string) ($material->title ?? ''));
         if ($title !== '') {
+            if (self::isPdfMaterial($material) && preg_match('/\.pdf$/i', $title)) {
+                return null;
+            }
+
             return $title;
         }
 
@@ -175,7 +179,56 @@ class QuizMaterialHelper
             }
         }
 
-        return [];
+        return self::materialsForTopicFromAnalysis($collection, $topic);
+    }
+
+    /**
+     * Match a quiz topic to PDF materials via cached Gemini/local analysis.
+     *
+     * @param  \Illuminate\Support\Collection<int, CourseMaterial>|iterable<CourseMaterial>  $materials
+     * @return array<int, CourseMaterial>
+     */
+    public static function materialsForTopicFromAnalysis(iterable $materials, string $topic): array
+    {
+        $topic = trim($topic);
+        if ($topic === '') {
+            return [];
+        }
+
+        $analysisService = app(\App\Services\Quiz\QuizMaterialAnalysisService::class);
+        $matched = [];
+
+        foreach ($materials as $material) {
+            if (!$material instanceof CourseMaterial || !self::isStudyMaterial($material) || !self::isPdfMaterial($material)) {
+                continue;
+            }
+
+            $map = $analysisService->getCachedKnowledgeMap($material);
+            if (!is_array($map) || $map === []) {
+                continue;
+            }
+
+            $labels = array_merge(
+                is_array($map['main_topics'] ?? null) ? $map['main_topics'] : [],
+                is_array($map['subtopics'] ?? null) ? $map['subtopics'] : [],
+            );
+
+            foreach ($labels as $label) {
+                $label = trim((string) $label);
+                if ($label === '') {
+                    continue;
+                }
+
+                if (strcasecmp($label, $topic) === 0
+                    || stripos($label, $topic) !== false
+                    || stripos($topic, $label) !== false) {
+                    $matched[$material->id] = $material;
+                    break;
+                }
+            }
+        }
+
+        return array_values($matched);
     }
 
     public static function quizStatus(CourseMaterial $quiz): string

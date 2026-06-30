@@ -43,4 +43,30 @@ class QuizAttempt extends Model
     {
         return $this->belongsTo(CourseMaterial::class, 'course_material_id');
     }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function toLearnerSummary(): array
+    {
+        $results = is_array($this->question_results) ? $this->question_results : [];
+        $pendingReview = $this->marked_at === null && (
+            collect($results)->contains(fn ($row) => !empty($row['pending_review']))
+            || ($this->marking_provider === 'manual' && $this->marked_at === null && $this->created_at !== null)
+        );
+
+        return [
+            'id' => $this->id,
+            'score' => (int) $this->score,
+            'max_score' => (int) $this->max_score,
+            'percentage' => round((float) $this->percentage, 1),
+            'passed' => (bool) $this->passed,
+            'feedback' => (string) ($this->feedback ?? ''),
+            'marking_provider' => (string) ($this->marking_provider ?? ''),
+            'pending_review' => $pendingReview,
+            'marked_at' => $this->marked_at?->toIso8601String(),
+            'created_at' => $this->created_at?->toIso8601String(),
+            'question_results' => $results,
+        ];
+    }
 }

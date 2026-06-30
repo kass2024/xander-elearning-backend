@@ -13,7 +13,9 @@ class LiveZoomCohort extends Model
     protected $table = 'livezoom_cohort';
 
     protected $fillable = [
+        'platform_institution_id',
         'day_of_week',
+        'available_on_date',
         'start_time',
         'end_time',
         'timezone',
@@ -34,6 +36,7 @@ class LiveZoomCohort extends Model
     protected $casts = [
         'is_active' => 'boolean',
         'day_of_week' => 'integer',
+        'available_on_date' => 'date:Y-m-d',
         'session_started_at' => 'datetime',
         'session_ended_at' => 'datetime',
         'current_queue_entry_id' => 'integer',
