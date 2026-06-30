@@ -7,23 +7,33 @@ use Illuminate\Support\Facades\Hash;
 
 class PlatformUserService
 {
-    public const ADMIN_EMAIL = 'infos@parrotglobalstudyacademy.ca';
+    public const DEFAULT_ADMIN_EMAIL = 'info@xanderglobalscholars.com';
 
-    /** @var array<string, string> */
+    /** @var array<string, string> Old Parrot logins → current platform admin. */
     private const LEGACY_EMAIL_ALIASES = [
-        'info@xanderglobalscholars.com' => self::ADMIN_EMAIL,
-        'admin@parrot.com' => self::ADMIN_EMAIL,
+        'infos@parrotglobalstudyacademy.ca' => self::DEFAULT_ADMIN_EMAIL,
+        'admin@parrot.com' => self::DEFAULT_ADMIN_EMAIL,
     ];
 
     /** @var list<string> */
     private const LEGACY_EMAILS_TO_DELETE = [
-        'info@xanderglobalscholars.com',
         'admin@parrot.com',
     ];
 
     public static function adminEmail(): string
     {
-        return self::ADMIN_EMAIL;
+        $fromEnv = trim((string) env('PLATFORM_ADMIN_EMAIL', ''));
+
+        return $fromEnv !== ''
+            ? strtolower($fromEnv)
+            : self::DEFAULT_ADMIN_EMAIL;
+    }
+
+    public static function adminDisplayName(): string
+    {
+        $fromEnv = trim((string) env('PLATFORM_ADMIN_NAME', ''));
+
+        return $fromEnv !== '' ? $fromEnv : 'Xander Global Scholars Admin';
     }
 
     public static function seedPassword(): string
@@ -37,8 +47,14 @@ class PlatformUserService
     public static function normalizeEmail(string $email): string
     {
         $normalized = strtolower(trim($email));
+        $admin = self::adminEmail();
 
-        return self::LEGACY_EMAIL_ALIASES[$normalized] ?? $normalized;
+        $aliases = array_merge(self::LEGACY_EMAIL_ALIASES, [
+            'infos@parrotglobalstudyacademy.ca' => $admin,
+            'admin@parrot.com' => $admin,
+        ]);
+
+        return $aliases[$normalized] ?? $normalized;
     }
 
     public static function verifyPassword(User $user, string $plain): bool
@@ -66,9 +82,48 @@ class PlatformUserService
     {
         $email = self::normalizeEmail($email);
 
-        User::query()
+        $user = User::query()
             ->whereRaw('LOWER(TRIM(email)) = ?', [$email])
-            ->update(['password' => Hash::make($plain)]);
+            ->first();
+
+        if ($user) {
+            self::setUserPassword($user, $plain);
+        }
+    }
+
+    /**
+     * Ensure the platform admin exists and password matches SEED_PLATFORM_PASSWORD.
+     */
+    public static function ensureAdminFromEnv(?string $plain = null): User
+    {
+        $plain = trim((string) ($plain ?? self::seedPassword()), " \t\n\r\0\x0B'\"");
+        if ($plain === '') {
+            throw new \InvalidArgumentException('Password cannot be empty. Set SEED_PLATFORM_PASSWORD in .env.');
+        }
+
+        $email = self::adminEmail();
+        $user = User::query()->whereRaw('LOWER(TRIM(email)) = ?', [$email])->first();
+
+        if (!$user) {
+            $user = User::create([
+                'email' => $email,
+                'name' => self::adminDisplayName(),
+                'password' => $plain,
+                'role' => 'admin',
+                'status' => 'Active',
+            ]);
+
+            return $user;
+        }
+
+        $user->fill([
+            'name' => self::adminDisplayName(),
+            'role' => 'admin',
+            'status' => 'Active',
+        ]);
+        self::setUserPassword($user, $plain);
+
+        return $user;
     }
 
     /**
@@ -93,21 +148,12 @@ class PlatformUserService
 
             $counts['users'] = User::query()->update(['password' => $hash]);
 
-            $adminEmail = self::adminEmail();
-            $admin = User::query()->whereRaw('LOWER(TRIM(email)) = ?', [$adminEmail])->first();
-            if (!$admin) {
-                User::create([
-                    'email' => $adminEmail,
-                    'name' => 'Parrot Canada Visa Consultant',
-                    'password' => $plain,
-                    'role' => 'admin',
-                    'status' => 'Active',
-                ]);
+            $hadAdmin = User::query()
+                ->whereRaw('LOWER(TRIM(email)) = ?', [self::adminEmail()])
+                ->exists();
+            self::ensureAdminFromEnv($plain);
+            if (!$hadAdmin) {
                 $counts['users']++;
-            } else {
-                $admin->fill(['role' => 'admin', 'status' => 'Active']);
-                $admin->password = $plain;
-                $admin->save();
             }
         }
 
@@ -160,9 +206,16 @@ class PlatformUserService
             return;
         }
 
+        $admin = self::adminEmail();
+
         foreach (self::LEGACY_EMAILS_TO_DELETE as $legacy) {
+            $legacy = strtolower(trim($legacy));
+            if ($legacy === $admin) {
+                continue;
+            }
+
             User::query()
-                ->whereRaw('LOWER(TRIM(email)) = ?', [strtolower(trim($legacy))])
+                ->whereRaw('LOWER(TRIM(email)) = ?', [$legacy])
                 ->delete();
         }
     }

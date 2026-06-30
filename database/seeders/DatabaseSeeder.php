@@ -17,26 +17,27 @@ class DatabaseSeeder extends Seeder
     public function run(): void
     {
         $plainPassword = PlatformUserService::seedPassword();
+        $adminEmail = PlatformUserService::adminEmail();
 
         PlatformUserService::dedupeDuplicateEmails();
         PlatformUserService::deleteLegacyEmails();
 
         self::seedPlatformUser(
-            'infos@parrotglobalstudyacademy.ca',
-            'Parrot Canada Visa Consultant',
+            $adminEmail,
+            PlatformUserService::adminDisplayName(),
             'admin',
             $plainPassword
         );
 
         self::seedPlatformUser(
-            'instructor@parrotglobalstudyacademy.ca',
+            'instructor@xanderglobalscholars.com',
             'Instructor User',
             'instructor',
             $plainPassword
         );
 
         self::seedPlatformUser(
-            'staff@parrotglobalstudyacademy.ca',
+            'staff@xanderglobalscholars.com',
             'Staff User',
             'staff',
             $plainPassword
@@ -74,6 +75,7 @@ class DatabaseSeeder extends Seeder
             'role' => $role,
             'status' => 'Active',
         ]);
+        $user->password = $plainPassword;
         $user->save();
     }
 }

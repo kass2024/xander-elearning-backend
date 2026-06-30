@@ -2,7 +2,6 @@
 
 namespace App\Console\Commands;
 
-use App\Models\User;
 use App\Support\PlatformUserService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
@@ -11,7 +10,7 @@ class ResetAdminPassword extends Command
 {
     protected $signature = 'users:reset-admin-password
                             {--password= : Plain password (defaults to SEED_PLATFORM_PASSWORD in .env)}
-                            {--email= : Admin email (defaults to platform admin email)}';
+                            {--email= : Admin email (defaults to PLATFORM_ADMIN_EMAIL or info@xanderglobalscholars.com)}';
 
     protected $description = 'Reset the platform admin login password without affecting other users';
 
@@ -23,9 +22,7 @@ class ResetAdminPassword extends Command
             return self::FAILURE;
         }
 
-        $email = PlatformUserService::normalizeEmail(
-            (string) ($this->option('email') ?: PlatformUserService::adminEmail())
-        );
+        $emailOption = trim((string) $this->option('email'));
         $plain = trim(
             (string) ($this->option('password') ?: PlatformUserService::seedPassword()),
             " \t\n\r\0\x0B'\""
@@ -37,27 +34,30 @@ class ResetAdminPassword extends Command
             return self::FAILURE;
         }
 
-        $user = User::query()->whereRaw('LOWER(TRIM(email)) = ?', [$email])->first();
-
-        if (!$user) {
-            $user = User::create([
-                'email' => $email,
-                'name' => 'Parrot Canada Visa Consultant',
-                'password' => $plain,
-                'role' => 'admin',
-                'status' => 'Active',
-            ]);
-            $this->info("Created admin user {$email}");
+        if ($emailOption === '') {
+            $user = PlatformUserService::ensureAdminFromEnv($plain);
+            $email = PlatformUserService::adminEmail();
+            $this->info("Admin password set for {$email}");
         } else {
+            $email = PlatformUserService::normalizeEmail($emailOption);
             PlatformUserService::resetPasswordForEmail($email, $plain);
-            $user->refresh();
+            $user = \App\Models\User::query()
+                ->whereRaw('LOWER(TRIM(email)) = ?', [$email])
+                ->first();
+
+            if (!$user) {
+                $this->error("No user found for {$email}");
+
+                return self::FAILURE;
+            }
+
             $this->info("Password reset for {$email}");
         }
 
         $matches = PlatformUserService::verifyPassword($user, $plain) ? 'yes' : 'no';
         $this->newLine();
         $this->line('Login credentials:');
-        $this->line("  Email:    {$email}");
+        $this->line("  Email:    {$user->email}");
         $this->line("  Password: {$plain}");
         $this->line("  Verified: {$matches}");
 
